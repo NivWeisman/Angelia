@@ -36,12 +36,16 @@
   (ert-run-tests-batch-and-exit))
 
 (defun angelia-tests-run-layer (layer)
-  "Run only the tests for LAYER (0, 1, or 2) and exit."
+  "Run only the tests for LAYER (0, 1, or 2) and exit.
+Layer 2 covers all SSH-localhost integration tests: file ops + PTY procs
++ (eventually) persistence."
   (angelia-tests--load-file "test-helpers.el")
   (pcase layer
     (0 (angelia-tests--load-file "test-server-unit.el"))
     (1 (angelia-tests--load-file "test-transport.el"))
-    (2 (angelia-tests--load-file "test-file-ops.el"))
+    (2 (angelia-tests--load-file "test-file-ops.el")
+       (angelia-tests--load-file "test-proc.el")
+       (angelia-tests--load-file "test-persistence.el"))
     (_ (error "Unknown test layer: %S" layer)))
   (ert-run-tests-batch-and-exit))
 

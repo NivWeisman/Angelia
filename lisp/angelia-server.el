@@ -194,14 +194,16 @@ the notification params (e.g. {data: STR-base64} for chunk events)."
 
 (defun angelia-server--cleanup-session (state)
   "Run kind-specific resource cleanup for STATE.
-Called from `angelia-server--end-session' before the row is removed.
-Currently handles file-write tmp files; other kinds add their own branches
-here as they land in later phases."
+Called from `angelia-server--end-session' before the row is removed."
   (pcase (plist-get state :kind)
     ('file-write
      (let ((tmp (plist-get state :tmp)))
        (when (and tmp (file-exists-p tmp))
-         (ignore-errors (delete-file tmp)))))))
+         (ignore-errors (delete-file tmp)))))
+    ('proc
+     (let ((proc (plist-get state :process)))
+       (when (and proc (process-live-p proc))
+         (ignore-errors (delete-process proc)))))))
 
 (defun angelia-server--end-session (conn session)
   "Emit a terminal `kind: \"end\"' event for SESSION and drop its state row.
@@ -625,6 +627,139 @@ Returns t."
 (angelia-server-register-method "file/list-dir"     #'angelia-server--file-list-dir)
 (angelia-server-register-method "file/mkdir"        #'angelia-server--file-mkdir)
 (angelia-server-register-method "file/delete"       #'angelia-server--file-delete)
+
+;; ---------------------------------------------------------------------------
+;; Remote process / PTY handlers.
+
+(defconst angelia-server--proc-allowed-signals
+  '("TERM" "KILL" "INT" "HUP" "QUIT")
+  "Signal names the wire protocol accepts; mapped to SIGTERM/SIGKILL/etc.")
+
+(defun angelia-server--proc-require-session (method params)
+  "Look up PARAMS->session as a `proc' session.  Signal error if not present."
+  (let* ((session (and (hash-table-p params) (gethash "session" params)))
+         (state (and session (gethash session angelia-server--sessions))))
+    (unless (and state (eq (plist-get state :kind) 'proc))
+      (error "%s: unknown or wrong-kind session: %S" method session))
+    (cons session state)))
+
+(defun angelia-server--proc-make-filter (conn session)
+  "Return a process filter that forwards bytes as session/event kind=output."
+  (lambda (_proc bytes)
+    (let ((p (make-hash-table :test #'equal)))
+      (puthash "data" (base64-encode-string bytes t) p)
+      (angelia-server--send-session-event conn session "output" p))))
+
+(defun angelia-server--proc-extract-signal-name (event)
+  "Parse the signal name out of EVENT (a sentinel event string)."
+  (let ((e (string-trim event)))
+    (cond
+     ((string-match "killed by signal[^A-Z]*\\([A-Z]+\\)" e)
+      (match-string 1 e))
+     ((string-match "\\bSIG\\([A-Z]+\\)\\b" e)
+      (match-string 1 e))
+     ((string-match "\\b\\(TERM\\|KILL\\|INT\\|HUP\\|QUIT\\|PIPE\\)\\b" e)
+      (match-string 1 e)))))
+
+(defun angelia-server--proc-make-sentinel (conn session)
+  "Return a sentinel that emits kind=exit then ends the session on death."
+  (lambda (proc event)
+    (let ((status (process-status proc)))
+      (when (memq status '(exit signal failed closed))
+        (let* ((exit-code (process-exit-status proc))
+               (signal-name (angelia-server--proc-extract-signal-name event))
+               (p (make-hash-table :test #'equal)))
+          (puthash "code" (if (eq status 'exit) exit-code :null) p)
+          (puthash "signal" (or signal-name :null) p)
+          (puthash "event" (string-trim event) p)
+          (angelia-server--send-session-event conn session "exit" p))
+        (angelia-server--end-session conn session)))))
+
+(defun angelia-server--proc-start (conn params)
+  "Spawn a PTY-backed remote process and stream its output as session events.
+Returns `{session, pid}'.  Recognised params:
+  argv  vector of strings -- argv[0] is the program, rest are args.
+  cwd   optional working directory.
+  env   optional hash-table merged into `process-environment'.
+  rows  optional initial PTY rows.
+  cols  optional initial PTY columns."
+  (let* ((argv (and (hash-table-p params) (gethash "argv" params)))
+         (cwd  (and (hash-table-p params) (gethash "cwd" params)))
+         (env  (and (hash-table-p params) (gethash "env" params)))
+         (rows (and (hash-table-p params) (gethash "rows" params)))
+         (cols (and (hash-table-p params) (gethash "cols" params))))
+    (unless (and (vectorp argv) (> (length argv) 0)
+                 (cl-every #'stringp (append argv nil)))
+      (error "proc/start: `argv' must be a non-empty vector of strings"))
+    (let* ((session (angelia-server--make-session-id))
+           (process-environment
+            (if (hash-table-p env)
+                (let ((envs (copy-sequence process-environment)))
+                  (maphash (lambda (k v)
+                             (push (format "%s=%s" k v) envs))
+                           env)
+                  envs)
+              process-environment))
+           (default-directory (or (and (stringp cwd) (file-name-as-directory cwd))
+                                  default-directory))
+           (proc (make-process
+                  :name (format "angelia-pty-%s" session)
+                  :command (append argv nil)
+                  :coding 'binary
+                  :connection-type 'pty
+                  :noquery t
+                  :filter (angelia-server--proc-make-filter conn session)
+                  :sentinel (angelia-server--proc-make-sentinel conn session))))
+      (when (and (integerp rows) (integerp cols))
+        (ignore-errors (set-process-window-size proc rows cols)))
+      (angelia-server--register-session
+       session (list :kind 'proc :process proc))
+      (let ((result (make-hash-table :test #'equal)))
+        (puthash "session" session result)
+        (puthash "pid" (process-id proc) result)
+        result))))
+
+(defun angelia-server--proc-input (_conn params)
+  "Decode PARAMS->data (base64) and write it to the PTY's stdin.
+Returns `{accepted: N}'."
+  (let* ((cell (angelia-server--proc-require-session "proc/input" params))
+         (state (cdr cell))
+         (b64 (and (hash-table-p params) (gethash "data" params))))
+    (unless (stringp b64)
+      (error "proc/input: missing string `data'"))
+    (let* ((bytes (base64-decode-string b64))
+           (proc (plist-get state :process)))
+      (process-send-string proc bytes)
+      (let ((h (make-hash-table :test #'equal)))
+        (puthash "accepted" (length bytes) h)
+        h))))
+
+(defun angelia-server--proc-resize (_conn params)
+  "Resize the PTY for PARAMS->session to PARAMS->rows by PARAMS->cols."
+  (let* ((cell (angelia-server--proc-require-session "proc/resize" params))
+         (state (cdr cell))
+         (rows (and (hash-table-p params) (gethash "rows" params)))
+         (cols (and (hash-table-p params) (gethash "cols" params))))
+    (unless (and (integerp rows) (integerp cols))
+      (error "proc/resize: rows/cols must be integers"))
+    (set-process-window-size (plist-get state :process) rows cols)
+    (make-hash-table :test #'equal)))
+
+(defun angelia-server--proc-signal (_conn params)
+  "Send PARAMS->signal (a short name like \"TERM\") to PARAMS->session's PID."
+  (let* ((cell (angelia-server--proc-require-session "proc/signal" params))
+         (state (cdr cell))
+         (sig (and (hash-table-p params) (gethash "signal" params))))
+    (unless (member sig angelia-server--proc-allowed-signals)
+      (error "proc/signal: signal must be one of %S, got %S"
+             angelia-server--proc-allowed-signals sig))
+    (signal-process (process-id (plist-get state :process)) (intern sig))
+    (make-hash-table :test #'equal)))
+
+(angelia-server-register-method "proc/start"  #'angelia-server--proc-start)
+(angelia-server-register-method "proc/input"  #'angelia-server--proc-input)
+(angelia-server-register-method "proc/resize" #'angelia-server--proc-resize)
+(angelia-server-register-method "proc/signal" #'angelia-server--proc-signal)
 
 ;; ---------------------------------------------------------------------------
 ;; Entry point.
