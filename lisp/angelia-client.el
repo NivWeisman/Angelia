@@ -26,10 +26,18 @@
 (define-error 'angelia-client-not-connected
   "No active Angelia connection for the requested host")
 
+(define-error 'angelia-client-session-error
+  "Angelia session error (missing id or unknown session)")
+
 (cl-defstruct (angelia-client--conn
                (:constructor angelia-client--conn-create))
-  "Bookkeeping for one live host connection."
-  host process jsonrpc stderr-buffer)
+  "Bookkeeping for one live host connection.
+The `sessions' slot is a hash from server-issued session id (string) to a
+plist `(:on-event FN :on-end FN)' registered by `angelia-client-open-session'.
+The notification dispatcher in `angelia-client-connect' uses it to route
+`session/event' notifications back to the caller that opened them."
+  host process jsonrpc stderr-buffer
+  (sessions (make-hash-table :test #'equal)))
 
 (defvar angelia-client--connections (make-hash-table :test #'equal)
   "Map HOST (string) -> live `angelia-client--conn'.")
@@ -114,9 +122,8 @@ on transport / handshake failure (cleaning up the dead process first)."
                           :process proc
                           :notification-dispatcher
                           (lambda (_c method params)
-                            (angelia-client--log
-                             "notification[%s]: %s %s" host method
-                             (angelia-client--truncate (format "%S" params) 300)))
+                            (angelia-client--dispatch-notification
+                             host method params))
                           :request-dispatcher
                           (lambda (_c method _params)
                             (angelia-client--log
@@ -171,6 +178,97 @@ on transport / handshake failure (cleaning up the dead process first)."
   "Return the live connection for HOST or signal `angelia-client-not-connected'."
   (or (angelia-client--existing-live-connection host)
       (signal 'angelia-client-not-connected (list :host host))))
+
+;; ---------------------------------------------------------------------------
+;; Sessions.
+;;
+;; A `session' is a server-issued opaque string returned by methods that open
+;; a stream (chunked file ops, PTY, ...).  The client registers per-session
+;; callbacks here; the notification dispatcher below routes incoming
+;; `session/event' notifications to them.  The terminal `kind: "end"' event
+;; tears the registration down on the client side.
+
+(defun angelia-client--dispatch-notification (host method params)
+  "Route incoming notification METHOD/PARAMS for HOST.
+Currently only `session/event' is meaningful; everything else is logged."
+  (let ((method-str (if (symbolp method) (symbol-name method) method)))
+    (angelia-client--log "notification[%s]: %s %s" host method-str
+                         (angelia-client--truncate (format "%S" params) 300))
+    (cond
+     ((equal method-str "session/event")
+      (angelia-client--handle-session-event host params))
+     (t
+      ;; Already logged above; nothing else to do.
+      nil))))
+
+(defun angelia-client--handle-session-event (host params)
+  "Look up the callback for PARAMS->session on HOST and dispatch it."
+  (let* ((conn (gethash host angelia-client--connections))
+         (sessions (and conn (angelia-client--conn-sessions conn)))
+         (session (plist-get params :session))
+         (kind (plist-get params :kind))
+         (entry (and sessions session (gethash session sessions))))
+    (cond
+     ((null entry)
+      (angelia-client--log
+       "session/event for unknown session=%s kind=%s (dropped)" session kind))
+     ((equal kind "end")
+      (let ((on-end (plist-get entry :on-end)))
+        (remhash session sessions)
+        (when on-end
+          (condition-case err (funcall on-end params)
+            (error
+             (angelia-client--log-error
+              (format "session=%s on-end" session) err))))))
+     (t
+      (let ((on-event (plist-get entry :on-event)))
+        (when on-event
+          (condition-case err (funcall on-event kind params)
+            (error
+             (angelia-client--log-error
+              (format "session=%s on-event kind=%s" session kind) err)))))))))
+
+(cl-defun angelia-client-open-session (host method params on-event
+                                            &key on-end timeout)
+  "Call METHOD on HOST with PARAMS and treat its result.session as a session id.
+Register ON-EVENT (called as (KIND PARAMS-PLIST) for each non-terminal
+event) and the optional ON-END (called once with the terminal PARAMS-PLIST).
+Returns the session id (a string).  Signals `angelia-client-session-error'
+if the server's response lacks a session id."
+  (let* ((conn (angelia-client-connection host))
+         (result (jsonrpc-request (angelia-client--conn-jsonrpc conn)
+                                  method params
+                                  :timeout (or timeout 30)))
+         (session (plist-get result :session)))
+    (unless (stringp session)
+      (signal 'angelia-client-session-error
+              (list :host host :method method :result result)))
+    (puthash session
+             (list :on-event on-event :on-end on-end)
+             (angelia-client--conn-sessions conn))
+    (angelia-client--log "session opened: host=%s session=%s method=%s"
+                         host session method)
+    session))
+
+(defun angelia-client-send-to-session (host session method params &optional timeout)
+  "Call METHOD on HOST with a fresh hash of PARAMS keys plus `session' = SESSION."
+  (let ((p (make-hash-table :test #'equal)))
+    (when (hash-table-p params)
+      (maphash (lambda (k v) (puthash k v p)) params))
+    (puthash "session" session p)
+    (angelia-client-call host method p timeout)))
+
+(defun angelia-client-close-session (host session)
+  "Request the server end SESSION, then drop the local callback unconditionally."
+  (when-let ((conn (gethash host angelia-client--connections)))
+    (remhash session (angelia-client--conn-sessions conn)))
+  (let ((p (make-hash-table :test #'equal)))
+    (puthash "session" session p)
+    (condition-case err
+        (angelia-client-call host 'session/close p 5)
+      (error
+       (angelia-client--log-error
+        (format "close-session host=%s session=%s" host session) err)))))
 
 ;; ---------------------------------------------------------------------------
 ;; RPC surface.

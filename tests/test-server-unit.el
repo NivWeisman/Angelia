@@ -314,4 +314,110 @@ contaminates the result."
       (when (and proc (process-live-p proc)) (delete-process proc))
       (kill-buffer stderr-buf))))
 
+;; ---------------------------------------------------------------------------
+;; Phase 1 -- sessions.
+
+(ert-deftest test-server-session-id-format ()
+  "Session ids are `s-' + 16 lowercase hex characters."
+  (dotimes (_ 50)
+    (let ((id (angelia-server--make-session-id)))
+      (should (string-match "\\`s-[0-9a-f]\\{16\\}\\'" id)))))
+
+(ert-deftest test-server-send-notification ()
+  "`angelia-server--send-notification' writes a frame with method+params and no id."
+  (let* ((payload (let ((p (make-hash-table :test #'equal)))
+                    (puthash "x" 1 p) p))
+         (frames (angelia-tests-capture-responses
+                   (angelia-server--send-notification
+                    nil "test/notify" payload))))
+    (should (= 1 (length frames)))
+    (let ((f (car frames)))
+      (should (equal (gethash "jsonrpc" f) "2.0"))
+      (should (equal (gethash "method" f) "test/notify"))
+      ;; The "id" key must be ABSENT (not just nil) -- a present nil id would
+      ;; serialise as `{...,"id":null,...}' which is a response, not a
+      ;; notification.
+      (should-not (gethash "id" f))
+      (should (equal (gethash "x" (gethash "params" f)) 1)))))
+
+(ert-deftest test-server-end-session-emits-end ()
+  "`angelia-server--end-session' emits one kind=end event and clears the row."
+  (clrhash angelia-server--sessions)
+  (let ((session "s-feedface00000001"))
+    (angelia-server--register-session session (list :kind 'test))
+    (should (gethash session angelia-server--sessions))
+    (let ((frames (angelia-tests-capture-responses
+                    (angelia-server--end-session nil session))))
+      (should (= 1 (length frames)))
+      (let* ((f (car frames))
+             (p (gethash "params" f)))
+        (should (equal (gethash "method" f) "session/event"))
+        (should (equal (gethash "session" p) session))
+        (should (equal (gethash "kind" p) "end"))))
+    (should-not (gethash session angelia-server--sessions))))
+
+(ert-deftest test-server-session-close-handler ()
+  "The `session/close' built-in ends the named session and returns t."
+  (clrhash angelia-server--sessions)
+  (let ((session "s-feedface00000002"))
+    (angelia-server--register-session session (list :kind 'test))
+    (let* ((params (let ((p (make-hash-table :test #'equal)))
+                     (puthash "session" session p) p))
+           (frames (angelia-tests-capture-responses
+                     (should (eq t (angelia-server--builtin-session-close
+                                    nil params))))))
+      (should (= 1 (length frames)))
+      (should (equal (gethash "kind" (gethash "params" (car frames))) "end")))
+    (should-not (gethash session angelia-server--sessions))))
+
+(ert-deftest test-server-session-echo-direct ()
+  "`session/echo' opens a session, emits N events with payload, then ends."
+  (clrhash angelia-server--sessions)
+  (let* ((params (let ((p (make-hash-table :test #'equal)))
+                   (puthash "count" 4 p)
+                   (puthash "payload" "marker" p)
+                   p))
+         session
+         (frames (angelia-tests-capture-responses
+                   (let ((result (angelia-server--builtin-session-echo
+                                  nil params)))
+                     (setq session (gethash "session" result))
+                     (should (stringp session))
+                     ;; Pump pending timers so the deferred run-at-time
+                     ;; lambda fires and the events + end are captured.
+                     (with-timeout (2 (error "session/echo timer did not fire"))
+                       (while (gethash session angelia-server--sessions)
+                         (accept-process-output nil 0.01)))))))
+    (should (= 5 (length frames)))  ; 4 echo + 1 end
+    (dotimes (i 4)
+      (let* ((f (nth i frames))
+             (p (gethash "params" f)))
+        (should (equal (gethash "method" f) "session/event"))
+        (should (equal (gethash "session" p) session))
+        (should (equal (gethash "kind" p) "echo"))
+        (should (equal (gethash "index" p) i))
+        (should (equal (gethash "payload" p) "marker"))))
+    (let* ((end-frame (nth 4 frames))
+           (p (gethash "params" end-frame)))
+      (should (equal (gethash "kind" p) "end"))
+      (should (equal (gethash "session" p) session)))))
+
+(ert-deftest test-server-session-echo-end-immediately ()
+  "`session/echo' with end-immediately=t emits no events, just `end'."
+  (clrhash angelia-server--sessions)
+  (let* ((params (let ((p (make-hash-table :test #'equal)))
+                   (puthash "count" 99 p)
+                   (puthash "end-immediately" t p)
+                   p))
+         session
+         (frames (angelia-tests-capture-responses
+                   (let ((result (angelia-server--builtin-session-echo
+                                  nil params)))
+                     (setq session (gethash "session" result))
+                     (with-timeout (2 (error "timer did not fire"))
+                       (while (gethash session angelia-server--sessions)
+                         (accept-process-output nil 0.01)))))))
+    (should (= 1 (length frames)))
+    (should (equal (gethash "kind" (gethash "params" (car frames))) "end"))))
+
 ;;; test-server-unit.el ends here

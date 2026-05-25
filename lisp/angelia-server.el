@@ -34,6 +34,12 @@
 (defvar angelia-server--start-time nil
   "Wall-clock time at which the server entered `angelia-server-main'.")
 
+(defvar angelia-server--sessions (make-hash-table :test #'equal)
+  "Server-global session registry: session-id (string) -> state plist.
+Long-lived streaming methods (chunked file I/O, PTY, ...) allocate a row
+here and key all subsequent events on the returned id.  Per-feature state
+lives in the plist (e.g. (:kind read-stream :offset N :total M)).")
+
 (define-error 'angelia-server-protocol-error "Angelia server protocol error")
 
 ;; ---------------------------------------------------------------------------
@@ -149,6 +155,53 @@ the `:null' keyword.  Both mean \"no response expected\"."
     (puthash "id" id resp)
     (puthash "result" result resp)
     resp))
+
+;; ---------------------------------------------------------------------------
+;; Sessions.
+;;
+;; A session is a server-generated opaque string returned by methods that open
+;; a stream (chunked file ops, PTYs, ...).  The client registers a callback
+;; against the id; the server pushes `session/event' notifications carrying
+;; `{session, kind, ...}'.  A terminal event with `kind: "end"' tears the
+;; session down on both sides.
+
+(defun angelia-server--make-session-id ()
+  "Return a fresh, never-before-seen session id of the form `s-<16-hex>'."
+  (let (id)
+    (while (or (null id) (gethash id angelia-server--sessions))
+      (setq id (format "s-%016x" (random (expt 2 64)))))
+    id))
+
+(defun angelia-server--send-notification (_conn method params)
+  "Write a JSON-RPC notification (no `id') with METHOD and PARAMS to stdout.
+PARAMS may be a hash-table, a JSON-serialisable list, or nil."
+  (let ((env (make-hash-table :test #'equal)))
+    (puthash "jsonrpc" "2.0" env)
+    (puthash "method" method env)
+    (when params (puthash "params" params env))
+    (angelia-server--write-frame env)))
+
+(defun angelia-server--send-session-event (conn session kind &optional payload)
+  "Push a `session/event' notification for SESSION carrying KIND.
+PAYLOAD, when non-nil, is a hash-table of additional fields to merge into
+the notification params (e.g. {data: STR-base64} for chunk events)."
+  (let ((params (make-hash-table :test #'equal)))
+    (puthash "session" session params)
+    (puthash "kind" kind params)
+    (when (hash-table-p payload)
+      (maphash (lambda (k v) (puthash k v params)) payload))
+    (angelia-server--send-notification conn "session/event" params)))
+
+(defun angelia-server--end-session (conn session)
+  "Emit a terminal `kind: \"end\"' event for SESSION and drop its state row.
+Safe to call on already-dead sessions; in that case it is a no-op."
+  (when (gethash session angelia-server--sessions)
+    (angelia-server--send-session-event conn session "end" nil)
+    (remhash session angelia-server--sessions)))
+
+(defun angelia-server--register-session (session state)
+  "Add a row for SESSION in the registry with STATE (a plist)."
+  (puthash session state angelia-server--sessions))
 
 ;; ---------------------------------------------------------------------------
 ;; Dispatch.
@@ -277,9 +330,58 @@ CONN is the connection context, passed verbatim to every handler."
              h)
     h))
 
+(defun angelia-server--builtin-session-close (conn params)
+  "Client-initiated close of the session named in PARAMS.
+Tears down both server-side state and any per-feature resources (write-stream
+temp file cleanup hooks etc. -- not yet wired) and emits the terminal `end'
+event.  Returns t."
+  (let ((session (and (hash-table-p params) (gethash "session" params))))
+    (unless (stringp session)
+      (error "session/close: missing or non-string `session' parameter"))
+    (angelia-server--end-session conn session)
+    t))
+
+(defun angelia-server--builtin-session-echo (conn params)
+  "Open a session and emit COUNT events with PAYLOAD, then end.
+This is the canonical test driver for the session machinery -- not part of
+the user-facing API, but kept always registered because it costs nothing
+and lets the ERT suite cover the streaming path without a stand-in.
+
+PARAMS keys (all optional):
+  count            integer, number of `echo' events to emit (default 1)
+  payload          string, copied verbatim into each event (default \"\")
+  end-immediately  boolean, when true emit `end' with no `echo' events
+
+Events emitted are deferred via `run-at-time' so the JSON-RPC response
+carrying the new session id reaches the client BEFORE the events do --
+otherwise the client would receive events for a session it hasn't
+registered a callback for yet, and drop them."
+  (let* ((session (angelia-server--make-session-id))
+         (count (or (and (hash-table-p params) (gethash "count" params)) 1))
+         (payload (or (and (hash-table-p params) (gethash "payload" params)) ""))
+         (end-now (and (hash-table-p params)
+                       (let ((v (gethash "end-immediately" params)))
+                         (and v (not (eq v :false))))))
+         (result (make-hash-table :test #'equal)))
+    (angelia-server--register-session session (list :kind 'echo))
+    (puthash "session" session result)
+    (run-at-time
+     0.005 nil
+     (lambda ()
+       (unless end-now
+         (dotimes (i count)
+           (let ((ev (make-hash-table :test #'equal)))
+             (puthash "index" i ev)
+             (puthash "payload" payload ev)
+             (angelia-server--send-session-event conn session "echo" ev))))
+       (angelia-server--end-session conn session)))
+    result))
+
 (angelia-server-register-method "server/ping"    #'angelia-server--builtin-ping)
 (angelia-server-register-method "server/version" #'angelia-server--builtin-version)
 (angelia-server-register-method "server/info"    #'angelia-server--builtin-info)
+(angelia-server-register-method "session/close"  #'angelia-server--builtin-session-close)
+(angelia-server-register-method "session/echo"   #'angelia-server--builtin-session-echo)
 
 ;; ---------------------------------------------------------------------------
 ;; File operation handlers.

@@ -140,4 +140,83 @@ up and reports the freshly-uploaded SHA1."
         (should (null (aref errors k)))
         (should (eq (plist-get (aref results k) :pong) t))))))
 
+;; ---------------------------------------------------------------------------
+;; Phase 1 -- sessions over the SSH pipe.
+
+(defun angelia-tests--echo-params (count payload &optional end-immediately)
+  "Build a session/echo params hash."
+  (let ((p (make-hash-table :test #'equal)))
+    (puthash "count" count p)
+    (puthash "payload" payload p)
+    (when end-immediately (puthash "end-immediately" t p))
+    p))
+
+(ert-deftest test-session-open-and-close ()
+  "Open a session/echo, receive N events + end, verify callback unregistered."
+  (angelia-tests--transport-setup)
+  (with-angelia-connection angelia-tests--target-host conn
+    (let* ((events '())
+           (ended nil)
+           (session
+            (angelia-client-open-session
+             angelia-tests--target-host 'session/echo
+             (angelia-tests--echo-params 3 "alpha")
+             (lambda (_kind params)
+               (push (plist-get params :index) events))
+             :on-end (lambda (_p) (setq ended t)))))
+      (should (stringp session))
+      ;; Session is registered locally until end arrives.
+      (should (gethash session (angelia-client--conn-sessions conn)))
+      (with-timeout (3 (error "session never ended"))
+        (while (not ended)
+          (accept-process-output nil 0.05)))
+      (should (equal (nreverse events) '(0 1 2)))
+      ;; After end, the callback row must be gone.
+      (should-not (gethash session (angelia-client--conn-sessions conn))))))
+
+(ert-deftest test-session-concurrent ()
+  "Three concurrent session/echo streams interleave correctly; each callback
+sees only its own session's events in order."
+  (angelia-tests--transport-setup)
+  (with-angelia-connection angelia-tests--target-host _conn
+    (let* ((indices (make-vector 3 nil))
+           (ends (make-vector 3 nil))
+           (sessions (make-vector 3 nil)))
+      (dotimes (k 3)
+        (let ((slot k))
+          (aset sessions slot
+                (angelia-client-open-session
+                 angelia-tests--target-host 'session/echo
+                 (angelia-tests--echo-params 5 (format "marker-%d" slot))
+                 (lambda (_kind params)
+                   ;; Sanity: payload must match this slot.
+                   (should (equal (plist-get params :payload)
+                                  (format "marker-%d" slot)))
+                   (push (plist-get params :index) (aref indices slot)))
+                 :on-end (lambda (_p) (aset ends slot t))))))
+      (with-timeout (5 (error "not all sessions ended: %S" ends))
+        (while (not (and (aref ends 0) (aref ends 1) (aref ends 2)))
+          (accept-process-output nil 0.05)))
+      (dotimes (k 3)
+        (should (equal (nreverse (aref indices k)) '(0 1 2 3 4))))
+      ;; The three session ids must be distinct.
+      (should (= 3 (length (delete-dups (append sessions nil))))))))
+
+(ert-deftest test-session-server-side-close ()
+  "When the server ends a session immediately, `on-end' fires with no events."
+  (angelia-tests--transport-setup)
+  (with-angelia-connection angelia-tests--target-host _conn
+    (let* ((events '())
+           (ended nil))
+      (angelia-client-open-session
+       angelia-tests--target-host 'session/echo
+       (angelia-tests--echo-params 99 "should-not-arrive" t)
+       (lambda (_kind params) (push params events))
+       :on-end (lambda (_p) (setq ended t)))
+      (with-timeout (3 (error "on-end never fired"))
+        (while (not ended)
+          (accept-process-output nil 0.05)))
+      (should ended)
+      (should (null events)))))
+
 ;;; test-transport.el ends here
