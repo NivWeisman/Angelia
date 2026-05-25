@@ -15,3 +15,9 @@ dist/
 
 # Undo-tree save-files
 *.~undo-tree
+
+# Test scratch
+tests/tmp/
+
+# Deploy cache markers
+*.deploy-cache
