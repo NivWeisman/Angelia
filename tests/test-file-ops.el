@@ -150,4 +150,36 @@ file/list-dir RPC that backs any future dired support."
               (should (equal got expected))))
         (when (file-exists-p local) (delete-file local))))))
 
+(ert-deftest test-very-large-file ()
+  "Write a 50 MB file via chunked transfer and verify SHA256 round-trip.
+With the default 64 KB chunk size this exercises ~800 chunks each way --
+validates the chunk loop under volume and the absence of byte loss."
+  (angelia-tests--file-ops-setup)
+  (with-angelia-connection angelia-tests--target-host _conn
+    (let* ((local (make-temp-file "angelia-very-large-"))
+           (size (* 50 1024 1024))                           ; 50 MB
+           ;; Single ASCII byte so the buffer is unibyte-clean; sentinels at
+           ;; the boundaries detect bytes silently swapped or dropped.
+           (content (let ((s (make-string size ?x)))
+                      (aset s 0 ?A)
+                      (aset s (/ size 2) ?M)
+                      (aset s (1- size) ?Z)
+                      s))
+           (expected (secure-hash 'sha256 content)))
+      (unwind-protect
+          (progn
+            (with-temp-buffer
+              (set-buffer-multibyte nil)
+              (insert content)
+              (write-region (point-min) (point-max)
+                            (angelia-tests--remote local)
+                            nil 'silent))
+            (let ((got
+                   (with-temp-buffer
+                     (set-buffer-multibyte nil)
+                     (insert-file-contents (angelia-tests--remote local))
+                     (secure-hash 'sha256 (current-buffer)))))
+              (should (equal got expected))))
+        (when (file-exists-p local) (delete-file local))))))
+
 ;;; test-file-ops.el ends here

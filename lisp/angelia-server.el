@@ -192,10 +192,25 @@ the notification params (e.g. {data: STR-base64} for chunk events)."
       (maphash (lambda (k v) (puthash k v params)) payload))
     (angelia-server--send-notification conn "session/event" params)))
 
+(defun angelia-server--cleanup-session (state)
+  "Run kind-specific resource cleanup for STATE.
+Called from `angelia-server--end-session' before the row is removed.
+Currently handles file-write tmp files; other kinds add their own branches
+here as they land in later phases."
+  (pcase (plist-get state :kind)
+    ('file-write
+     (let ((tmp (plist-get state :tmp)))
+       (when (and tmp (file-exists-p tmp))
+         (ignore-errors (delete-file tmp)))))))
+
 (defun angelia-server--end-session (conn session)
   "Emit a terminal `kind: \"end\"' event for SESSION and drop its state row.
-Safe to call on already-dead sessions; in that case it is a no-op."
-  (when (gethash session angelia-server--sessions)
+Runs per-kind resource cleanup (see `angelia-server--cleanup-session') first
+so abandoned streams release temp files / processes / etc. before the row
+disappears.  Safe to call on already-dead sessions; in that case it is a
+no-op."
+  (when-let ((state (gethash session angelia-server--sessions)))
+    (angelia-server--cleanup-session state)
     (angelia-server--send-session-event conn session "end" nil)
     (remhash session angelia-server--sessions)))
 
@@ -412,33 +427,138 @@ METHOD is the calling method name (for error reporting only)."
     (puthash "mode"  (file-attribute-modes attrs) h)
     h))
 
-(defun angelia-server--file-read (_conn params)
-  "Read PARAMS->path and return {content: base64(bytes), size: N}."
-  (let ((path (angelia-server--require-string-path "file/read" params)))
-    (with-temp-buffer
-      (set-buffer-multibyte nil)
-      (insert-file-contents-literally path)
-      (let* ((bytes (buffer-string))
-             (h     (make-hash-table :test #'equal)))
-        (puthash "content" (base64-encode-string bytes t) h)
-        (puthash "size"    (length bytes) h)
+(defconst angelia-server--default-chunk-size (* 64 1024)
+  "Default chunk size in bytes for streaming reads and writes.")
+
+(defun angelia-server--file-read (conn params)
+  "Streamed read.  Returns `{session, size}'; the file bytes follow as a
+sequence of `session/event {kind: \"chunk\", data: STR-base64}'
+notifications terminated by `kind: \"end\"'.  Optional `chunk-size'
+overrides `angelia-server--default-chunk-size'.
+
+Emission is deferred via `run-at-time' so the JSON-RPC response reaches
+the client BEFORE its chunks do; otherwise the client would receive
+events for a session it has not yet registered a callback for."
+  (let* ((path (angelia-server--require-string-path "file/read" params))
+         (chunk-size (or (and (hash-table-p params)
+                              (gethash "chunk-size" params))
+                         angelia-server--default-chunk-size))
+         (attrs (file-attributes path))
+         (size (and attrs (file-attribute-size attrs))))
+    (unless attrs
+      (error "file/read: not found: %s" path))
+    (let ((session (angelia-server--make-session-id))
+          (result (make-hash-table :test #'equal)))
+      (angelia-server--register-session
+       session (list :kind 'file-read :path path :size size))
+      (puthash "session" session result)
+      (puthash "size" size result)
+      (run-at-time
+       0.005 nil
+       (lambda ()
+         (condition-case err
+             (let ((offset 0))
+               (while (< offset size)
+                 (let* ((end (min size (+ offset chunk-size)))
+                        (bytes (with-temp-buffer
+                                 (set-buffer-multibyte nil)
+                                 (insert-file-contents-literally
+                                  path nil offset end)
+                                 (buffer-string)))
+                        (payload (make-hash-table :test #'equal)))
+                   (puthash "data" (base64-encode-string bytes t) payload)
+                   (angelia-server--send-session-event
+                    conn session "chunk" payload)
+                   (setq offset end)))
+               (angelia-server--end-session conn session))
+           (error
+            (angelia-server--log-error err)
+            (let ((p (make-hash-table :test #'equal)))
+              (puthash "message" (error-message-string err) p)
+              (angelia-server--send-session-event
+               conn session "error" p))
+            (angelia-server--end-session conn session)))))
+      result)))
+
+(defun angelia-server--file-write-open (_conn params)
+  "Open an atomic chunked write to PARAMS->path of declared PARAMS->size bytes.
+Returns `{session}'.  Bytes are buffered into a sibling temp file in the
+target's directory; `file/write-finish' renames it into place atomically.
+If the session is closed without finishing, `--cleanup-session' deletes
+the temp file."
+  (let* ((path (angelia-server--require-string-path "file/write-open" params))
+         (size (and (hash-table-p params) (gethash "size" params)))
+         (dir (file-name-directory path)))
+    (unless (integerp size)
+      (error "file/write-open: missing integer `size' parameter"))
+    (unless (file-directory-p dir)
+      (error "file/write-open: parent directory does not exist: %s" dir))
+    (let* ((tmp (make-temp-file
+                 (expand-file-name ".angelia-write-" dir)))
+           (session (angelia-server--make-session-id))
+           (result (make-hash-table :test #'equal)))
+      (angelia-server--register-session
+       session
+       (list :kind 'file-write
+             :path path
+             :tmp tmp
+             :expected-size size
+             :written-so-far 0))
+      (puthash "session" session result)
+      result)))
+
+(defun angelia-server--file-write-chunk (_conn params)
+  "Append PARAMS->data (base64) to the open write session PARAMS->session.
+Returns `{accepted: N}' where N is the running byte count."
+  (let* ((session (and (hash-table-p params) (gethash "session" params)))
+         (b64 (and (hash-table-p params) (gethash "data" params)))
+         (state (and session (gethash session angelia-server--sessions))))
+    (unless (and (stringp session) state
+                 (eq (plist-get state :kind) 'file-write))
+      (error "file/write-chunk: unknown or wrong-kind session: %S" session))
+    (unless (stringp b64)
+      (error "file/write-chunk: missing string `data' parameter"))
+    (let* ((bytes (base64-decode-string b64))
+           (tmp (plist-get state :tmp))
+           (running (+ (plist-get state :written-so-far) (length bytes)))
+           (coding-system-for-write 'binary))
+      (write-region bytes nil tmp t 'silent)
+      ;; plist-put mutates in place for existing keys, but we re-store the
+      ;; (possibly new) head defensively.
+      (puthash session
+               (plist-put state :written-so-far running)
+               angelia-server--sessions)
+      (let ((h (make-hash-table :test #'equal)))
+        (puthash "accepted" running h)
         h))))
 
-(defun angelia-server--file-write (_conn params)
-  "Decode PARAMS->content from base64 and write it to PARAMS->path.
-Returns {written: N}."
-  (let ((path (angelia-server--require-string-path "file/write" params))
-        (b64  (and (hash-table-p params) (gethash "content" params))))
-    (unless (stringp b64)
-      (error "file/write: missing or non-string `content' parameter"))
-    (let* ((bytes (base64-decode-string b64))
-           (coding-system-for-write 'binary))
-      (with-temp-buffer
-        (set-buffer-multibyte nil)
-        (insert bytes)
-        (write-region (point-min) (point-max) path nil 'silent))
+(defun angelia-server--file-write-finish (conn params)
+  "Atomically rename the tmp file for PARAMS->session into its target path.
+Ends the session (emitting `kind: \"end\"') and returns `{written: N}'.
+If the running byte count differs from the declared size, signals an
+error and leaves the tmp file in place for `--cleanup-session' to drop."
+  (let* ((session (and (hash-table-p params) (gethash "session" params)))
+         (state (and session (gethash session angelia-server--sessions))))
+    (unless (and (stringp session) state
+                 (eq (plist-get state :kind) 'file-write))
+      (error "file/write-finish: unknown or wrong-kind session: %S" session))
+    (let ((tmp (plist-get state :tmp))
+          (path (plist-get state :path))
+          (expected (plist-get state :expected-size))
+          (written (plist-get state :written-so-far)))
+      (unless (equal expected written)
+        (error "file/write-finish: size mismatch (declared=%S written=%S)"
+               expected written))
+      ;; `rename-file' with OK-IF-ALREADY-EXISTS=t overwrites atomically.
+      (rename-file tmp path t)
+      ;; tmp is gone; clear it from state so cleanup doesn't try to delete
+      ;; the now-renamed target file.
+      (puthash session
+               (plist-put state :tmp nil)
+               angelia-server--sessions)
+      (angelia-server--end-session conn session)
       (let ((h (make-hash-table :test #'equal)))
-        (puthash "written" (length bytes) h)
+        (puthash "written" written h)
         h))))
 
 (defun angelia-server--file-exists (_conn params)
@@ -495,14 +615,16 @@ Returns t."
     (delete-file path)
     t))
 
-(angelia-server-register-method "file/read"        #'angelia-server--file-read)
-(angelia-server-register-method "file/write"       #'angelia-server--file-write)
-(angelia-server-register-method "file/exists"      #'angelia-server--file-exists)
-(angelia-server-register-method "file/directory-p" #'angelia-server--file-directory-p)
-(angelia-server-register-method "file/attributes"  #'angelia-server--file-attributes)
-(angelia-server-register-method "file/list-dir"    #'angelia-server--file-list-dir)
-(angelia-server-register-method "file/mkdir"       #'angelia-server--file-mkdir)
-(angelia-server-register-method "file/delete"      #'angelia-server--file-delete)
+(angelia-server-register-method "file/read"         #'angelia-server--file-read)
+(angelia-server-register-method "file/write-open"   #'angelia-server--file-write-open)
+(angelia-server-register-method "file/write-chunk"  #'angelia-server--file-write-chunk)
+(angelia-server-register-method "file/write-finish" #'angelia-server--file-write-finish)
+(angelia-server-register-method "file/exists"       #'angelia-server--file-exists)
+(angelia-server-register-method "file/directory-p"  #'angelia-server--file-directory-p)
+(angelia-server-register-method "file/attributes"   #'angelia-server--file-attributes)
+(angelia-server-register-method "file/list-dir"     #'angelia-server--file-list-dir)
+(angelia-server-register-method "file/mkdir"        #'angelia-server--file-mkdir)
+(angelia-server-register-method "file/delete"       #'angelia-server--file-delete)
 
 ;; ---------------------------------------------------------------------------
 ;; Entry point.

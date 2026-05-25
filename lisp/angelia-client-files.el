@@ -54,50 +54,75 @@
 ;; ---------------------------------------------------------------------------
 ;; Operation dispatchers.
 
+(defconst angelia-client-files--write-chunk-size (* 64 1024)
+  "Bytes per chunk for chunked writes via `file/write-chunk'.")
+
+(defconst angelia-client-files--io-timeout 120
+  "Seconds before a streamed read/write gives up and signals an error.")
+
 (defun angelia-client-files--insert-file-contents (host remote args)
-  "Read REMOTE on HOST and insert its bytes into the current buffer.
-ARGS is the full argument list to `insert-file-contents'."
+  "Read REMOTE on HOST via chunked `file/read' and insert the bytes here.
+ARGS is the full argument list to `insert-file-contents'.  Chunks arrive
+as `session/event' notifications; we accumulate them under a registered
+callback then insert the joined bytes (decoded as UTF-8) at point."
   (let* ((filename (nth 0 args))
          (visit    (nth 1 args))
          (beg      (nth 2 args))
          (end      (nth 3 args))
          (replace  (nth 4 args))
-         (resp (angelia-client-call
-                host 'file/read
-                (angelia-client-files--params "path" remote)))
-         (decoded (base64-decode-string (plist-get resp :content)))
-         (selected (cond ((and beg end) (substring decoded beg end))
-                         (beg           (substring decoded beg))
-                         (end           (substring decoded 0 end))
-                         (t             decoded))))
-    (when replace
-      (delete-region (point-min) (point-max)))
-    ;; Buffer is multibyte by default; insert raw bytes by going via a unibyte
-    ;; temp buffer and then decoding as UTF-8.  Binary files still survive
-    ;; via the base64 transport even if the in-buffer view is munged.
-    (insert (decode-coding-string selected 'utf-8 t))
-    (when visit
-      (setq buffer-file-name filename)
-      (set-buffer-modified-p nil)
-      ;; Record the remote file's mtime as the buffer's last-visited modtime.
-      ;; With no arg, `set-visited-file-modtime' looks up `file-attributes' on
-      ;; the visited path -- which routes through our handler -- so the value
-      ;; it records matches what `verify-visited-file-modtime' will read
-      ;; later, and `save-buffer' skips the "changed since visited" prompt.
-      (set-visited-file-modtime)
-      ;; Disable on-save backups + lockfiles + autosave for this buffer.
-      ;; Each of those tries to operate on the local fs path, which doesn't
-      ;; exist; the result is `save-buffer' failing with `file-missing'.  The
-      ;; user can opt back in by clearing these locals if they want remote
-      ;; backups (which would need their own RPC handlers).
-      (setq-local backup-inhibited t)
-      (setq-local create-lockfiles nil)
-      (auto-save-mode -1))
-    (list filename (length selected))))
+         (chunks   '())
+         (ended    nil)
+         (failed   nil))
+    (angelia-client-open-session
+     host 'file/read
+     (angelia-client-files--params "path" remote)
+     (lambda (kind params)
+       (pcase kind
+         ("chunk"
+          (push (base64-decode-string (plist-get params :data)) chunks))
+         ("error"
+          (setq failed (or (plist-get params :message) "remote read error")))))
+     :on-end (lambda (_p) (setq ended t)))
+    (with-timeout (angelia-client-files--io-timeout
+                   (error "file/read timed out for %s" remote))
+      (while (not ended)
+        (accept-process-output nil 0.05)))
+    (when failed (error "file/read: %s" failed))
+    (let* ((all (apply #'concat (nreverse chunks)))
+           (selected (cond ((and beg end) (substring all beg end))
+                           (beg           (substring all beg))
+                           (end           (substring all 0 end))
+                           (t             all))))
+      (when replace
+        (delete-region (point-min) (point-max)))
+      ;; Buffer is multibyte by default; binary content still survives the
+      ;; base64 transport but the in-buffer view may be munged.
+      (insert (decode-coding-string selected 'utf-8 t))
+      (when visit
+        (setq buffer-file-name filename)
+        (set-buffer-modified-p nil)
+        ;; Record the remote file's mtime as the buffer's last-visited modtime.
+        ;; With no arg, `set-visited-file-modtime' looks up `file-attributes'
+        ;; on the visited path -- which routes through our handler -- so the
+        ;; recorded value matches what `verify-visited-file-modtime' reads
+        ;; later, silencing `save-buffer''s "changed since visited" prompt.
+        (set-visited-file-modtime)
+        ;; Disable on-save backups + lockfiles + autosave for this buffer.
+        ;; Each of those tries to operate on the local fs path, which doesn't
+        ;; exist; the result is `save-buffer' failing with `file-missing'.
+        ;; The user can opt back in by clearing these locals if they want
+        ;; remote backups (which would need their own RPC handlers).
+        (setq-local backup-inhibited t)
+        (setq-local create-lockfiles nil)
+        (auto-save-mode -1))
+      (list filename (length selected)))))
 
 (defun angelia-client-files--write-region (host remote args)
-  "Send the contents of the START..END region to REMOTE on HOST.
-ARGS is the full argument list to `write-region'."
+  "Stream the START..END region of the current buffer to REMOTE on HOST.
+ARGS is the full argument list to `write-region'.  Uses the three-phase
+`file/write-open' -> `file/write-chunk' (repeated) -> `file/write-finish'
+flow.  On any error mid-stream, sends `session/close' so the server drops
+its in-progress tmp file."
   (let* ((start (nth 0 args))
          (end   (nth 1 args))
          (filename (nth 2 args))
@@ -111,17 +136,45 @@ ARGS is the full argument list to `write-region'."
                   (buffer-substring-no-properties (point-min) (point-max)))
                  (t (buffer-substring-no-properties start end))))
          (encoded (encode-coding-string bytes 'utf-8 t))
-         (b64 (base64-encode-string encoded t)))
+         (total (length encoded))
+         (chunk-size angelia-client-files--write-chunk-size))
     (when append
       (error "angelia: write-region :append is not implemented"))
-    (angelia-client-call host 'file/write
-                         (angelia-client-files--params
-                          "path" remote
-                          "content" b64))
+    ;; Open via `angelia-client-open-session' so the local session row is
+    ;; registered (with no-op callbacks) before any events arrive.  The
+    ;; server emits a `kind: "end"' notification from `--end-session' inside
+    ;; `file/write-finish'; our no-op `on-end' simply unregisters the row.
+    (let ((session (angelia-client-open-session
+                    host 'file/write-open
+                    (angelia-client-files--params
+                     "path" remote
+                     "size" total)
+                    (lambda (_kind _params) nil)
+                    :on-end (lambda (_p) nil)
+                    :timeout angelia-client-files--io-timeout)))
+      (condition-case err
+          (progn
+            (let ((offset 0))
+              (while (< offset total)
+                (let* ((chunk-end (min total (+ offset chunk-size)))
+                       (chunk (substring encoded offset chunk-end))
+                       (p (make-hash-table :test #'equal)))
+                  (puthash "session" session p)
+                  (puthash "data" (base64-encode-string chunk t) p)
+                  (angelia-client-call host 'file/write-chunk p
+                                       angelia-client-files--io-timeout)
+                  (setq offset chunk-end))))
+            (let ((p (make-hash-table :test #'equal)))
+              (puthash "session" session p)
+              (angelia-client-call host 'file/write-finish p
+                                   angelia-client-files--io-timeout)))
+        (error
+         (angelia-client-close-session host session)
+         (signal (car err) (cdr err)))))
     (when (or (eq visit t) (stringp visit))
       (setq buffer-file-name (if (stringp visit) visit filename))
       (set-buffer-modified-p nil)
-      (set-visited-file-modtime (current-time)))
+      (set-visited-file-modtime))
     (unless (or (null visit) (eq visit t) (stringp visit))
       (message "Wrote %s" filename))
     nil))

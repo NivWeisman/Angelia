@@ -184,37 +184,150 @@
 ;; ---------------------------------------------------------------------------
 ;; File-operation handlers — gated on Step 6 implementations.
 
+(defun angelia-tests--collect-session-events (frames kind)
+  "Return the list of frames in FRAMES whose params kind == KIND."
+  (cl-remove-if-not
+   (lambda (f) (equal (gethash "kind" (gethash "params" f)) kind))
+   frames))
+
+(defun angelia-tests--drive-file-read (path &optional chunk-size)
+  "Call angelia-server--file-read on PATH, pump timers, return (SESSION FRAMES)."
+  (let* ((params (make-hash-table :test #'equal))
+         (_ (puthash "path" path params))
+         (_ (when chunk-size (puthash "chunk-size" chunk-size params)))
+         session
+         (frames (angelia-tests-capture-responses
+                   (let ((result (angelia-server--file-read nil params)))
+                     (setq session (gethash "session" result))
+                     (should (stringp session))
+                     (with-timeout (5 (error "file/read timer did not fire"))
+                       (while (gethash session angelia-server--sessions)
+                         (accept-process-output nil 0.01)))))))
+    (list session frames)))
+
 (ert-deftest test-server-file-read ()
-  "file/read returns base64-encoded file contents."
-  (skip-unless (fboundp 'angelia-server--file-read))
+  "file/read streams the file as base64 chunks terminated by `end'."
+  (clrhash angelia-server--sessions)
   (angelia-tests-with-temp-dir dir
     (let* ((path (expand-file-name "hello.txt" dir))
            (content "hello, angelia\n"))
       (angelia-tests-write-file path content)
-      (let* ((params (make-hash-table :test #'equal))
-             (_ (puthash "path" path params))
-             (result (funcall (symbol-function 'angelia-server--file-read)
-                              (angelia-server--conn-create) params))
-             (encoded (gethash "content" result))
-             (decoded (base64-decode-string encoded)))
-        (should (equal decoded content))))))
+      (pcase-let* ((`(,_session ,frames)
+                    (angelia-tests--drive-file-read path)))
+        (let* ((chunks (angelia-tests--collect-session-events frames "chunk"))
+               (ends   (angelia-tests--collect-session-events frames "end"))
+               (joined (apply #'concat
+                              (mapcar (lambda (f)
+                                        (base64-decode-string
+                                         (gethash "data"
+                                                  (gethash "params" f))))
+                                      chunks))))
+          (should (= 1 (length ends)))
+          (should (>= (length chunks) 1))
+          (should (equal joined content)))))))
+
+(ert-deftest test-server-file-read-chunks-large ()
+  "A 256 KB file read with 64 KB chunks yields exactly 4 chunk events + 1 end."
+  (clrhash angelia-server--sessions)
+  (angelia-tests-with-temp-dir dir
+    (let* ((path (expand-file-name "big.bin" dir))
+           (content (make-string (* 256 1024) ?A)))
+      (angelia-tests-write-file path content)
+      (pcase-let* ((`(,_session ,frames)
+                    (angelia-tests--drive-file-read path (* 64 1024))))
+        (let ((chunks (angelia-tests--collect-session-events frames "chunk"))
+              (ends   (angelia-tests--collect-session-events frames "end")))
+          (should (= 4 (length chunks)))
+          (should (= 1 (length ends)))
+          (let ((joined (apply #'concat
+                               (mapcar (lambda (f)
+                                         (base64-decode-string
+                                          (gethash "data"
+                                                   (gethash "params" f))))
+                                       chunks))))
+            (should (equal joined content))))))))
+
+(defun angelia-tests--open-write-session (path size)
+  "Drive file/write-open and return the session id."
+  (let ((p (make-hash-table :test #'equal)))
+    (puthash "path" path p)
+    (puthash "size" size p)
+    (gethash "session" (angelia-server--file-write-open nil p))))
+
+(defun angelia-tests--write-chunk (session bytes)
+  "Drive file/write-chunk for SESSION with BYTES; return its result hash."
+  (let ((p (make-hash-table :test #'equal)))
+    (puthash "session" session p)
+    (puthash "data" (base64-encode-string bytes t) p)
+    (angelia-server--file-write-chunk nil p)))
+
+(defun angelia-tests--finish-write (session)
+  "Drive file/write-finish for SESSION, swallowing the synthetic `end' event."
+  (let ((p (make-hash-table :test #'equal)))
+    (puthash "session" session p)
+    (cl-letf (((symbol-function 'angelia-server--write-frame)
+               (lambda (_) nil)))
+      (angelia-server--file-write-finish nil p))))
 
 (ert-deftest test-server-file-write ()
-  "file/write writes base64-decoded bytes to disk."
-  (skip-unless (fboundp 'angelia-server--file-write))
+  "file/write-* writes base64-decoded bytes to disk in one chunk + atomic rename."
+  (clrhash angelia-server--sessions)
   (angelia-tests-with-temp-dir dir
     (let* ((path (expand-file-name "out.txt" dir))
            (content "round-trip payload\n")
-           (params (make-hash-table :test #'equal)))
-      (puthash "path" path params)
-      (puthash "content" (base64-encode-string content t) params)
-      (funcall (symbol-function 'angelia-server--file-write)
-               (angelia-server--conn-create) params)
+           (session (angelia-tests--open-write-session path (length content))))
+      (should (= (gethash "accepted"
+                          (angelia-tests--write-chunk session content))
+                 (length content)))
+      (should (= (gethash "written" (angelia-tests--finish-write session))
+                 (length content)))
       (should (file-exists-p path))
       (with-temp-buffer
         (set-buffer-multibyte nil)
         (insert-file-contents-literally path)
         (should (equal (buffer-string) content))))))
+
+(ert-deftest test-server-file-write-multi-chunk ()
+  "A 256 KB write streamed in four 64 KB chunks lands intact (SHA256 match)."
+  (clrhash angelia-server--sessions)
+  (angelia-tests-with-temp-dir dir
+    (let* ((path (expand-file-name "multi.bin" dir))
+           (size (* 256 1024))
+           (content (let ((s (make-string size ?M)))
+                      (aset s 0 ?A)
+                      (aset s (1- size) ?Z)
+                      s))
+           (expected (secure-hash 'sha256 content))
+           (session (angelia-tests--open-write-session path size)))
+      (dotimes (i 4)
+        (let* ((start (* i (* 64 1024)))
+               (chunk (substring content start (+ start (* 64 1024)))))
+          (angelia-tests--write-chunk session chunk)))
+      (should (= (gethash "written" (angelia-tests--finish-write session))
+                 size))
+      (with-temp-buffer
+        (set-buffer-multibyte nil)
+        (insert-file-contents-literally path)
+        (should (equal (secure-hash 'sha256 (current-buffer)) expected))))))
+
+(ert-deftest test-server-file-write-abandoned ()
+  "Closing a write session without finish deletes the tmp + leaves target alone."
+  (clrhash angelia-server--sessions)
+  (angelia-tests-with-temp-dir dir
+    (let* ((path (expand-file-name "abandoned.txt" dir))
+           (session (angelia-tests--open-write-session path 10))
+           (tmp (plist-get (gethash session angelia-server--sessions) :tmp)))
+      (should (stringp tmp))
+      (should (file-exists-p tmp))
+      (angelia-tests--write-chunk session "1234567890")
+      (let ((p (make-hash-table :test #'equal)))
+        (puthash "session" session p)
+        (cl-letf (((symbol-function 'angelia-server--write-frame)
+                   (lambda (_) nil)))
+          (angelia-server--builtin-session-close nil p)))
+      (should-not (file-exists-p tmp))
+      (should-not (file-exists-p path))
+      (should-not (gethash session angelia-server--sessions)))))
 
 (ert-deftest test-server-file-exists ()
   "file/exists is true for existing paths and false otherwise."
