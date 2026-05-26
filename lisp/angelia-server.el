@@ -662,15 +662,29 @@ Returns t."
       (angelia-server--send-session-event conn session "output" p))))
 
 (defun angelia-server--proc-extract-signal-name (event)
-  "Parse the signal name out of EVENT (a sentinel event string)."
+  "Parse the signal name out of EVENT (a sentinel event string).
+Recognises both the C-style upper-case forms (`SIGTERM', `TERM',
+`\"killed by signal SIGTERM\"') AND Emacs's own lower-case sentinel
+strings (`interrupt', `terminated', `hangup', ...) -- the lower-case
+forms are what Emacs actually emits in batch mode for most signals,
+so without these branches `:signal' came back as nil and clients had
+to substring-match the event field for hints."
   (let ((e (string-trim event)))
     (cond
      ((string-match "killed by signal[^A-Z]*\\([A-Z]+\\)" e)
-      (match-string 1 e))
+      (let ((s (match-string 1 e)))
+        (if (string-prefix-p "SIG" s) (substring s 3) s)))
      ((string-match "\\bSIG\\([A-Z]+\\)\\b" e)
       (match-string 1 e))
      ((string-match "\\b\\(TERM\\|KILL\\|INT\\|HUP\\|QUIT\\|PIPE\\)\\b" e)
-      (match-string 1 e)))))
+      (match-string 1 e))
+     ;; Emacs's own lower-case sentinel phrasing.
+     ((string-match-p "\\`interrupt" e)   "INT")
+     ((string-match-p "\\`terminated" e)  "TERM")
+     ((string-match-p "\\`killed" e)      "KILL")
+     ((string-match-p "\\`hangup" e)      "HUP")
+     ((string-match-p "\\`quit" e)        "QUIT")
+     ((string-match-p "broken pipe" e)    "PIPE"))))
 
 (defun angelia-server--proc-make-sentinel (conn session)
   "Return a sentinel that emits kind=exit then ends the session on death."

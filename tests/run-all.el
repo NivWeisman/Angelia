@@ -45,7 +45,8 @@ Layer 2 covers all SSH-localhost integration tests: file ops + PTY procs
     (1 (angelia-tests--load-file "test-transport.el"))
     (2 (angelia-tests--load-file "test-file-ops.el")
        (angelia-tests--load-file "test-proc.el")
-       (angelia-tests--load-file "test-persistence.el"))
+       (angelia-tests--load-file "test-persistence.el")
+       (angelia-tests--load-file "test-term.el"))
     (_ (error "Unknown test layer: %S" layer)))
   (ert-run-tests-batch-and-exit))
 

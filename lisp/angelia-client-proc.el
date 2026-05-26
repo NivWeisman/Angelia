@@ -237,6 +237,7 @@ ARGV is a list of strings (e.g. `(\"bash\")' or `(\"top\" \"-n\" \"1\")')."
     (setq handle
           (angelia-client-proc-start
            host argv
+           :buffer buf
            :on-output
            (lambda (bytes)
              (when (buffer-live-p buf)
