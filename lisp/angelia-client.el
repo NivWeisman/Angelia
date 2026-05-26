@@ -176,6 +176,25 @@ on transport / handshake failure (cleaning up the dead process first)."
       (delete-process (angelia-client--conn-process conn)))
     (remhash host angelia-client--connections)))
 
+(defun angelia-client-reconnect (host)
+  "Disconnect from HOST (if connected) then establish a fresh connection.
+Returns the new connection.  Useful when the SSH pipe has dropped or the
+remote server is unresponsive."
+  (interactive (list (angelia-client--read-host "Reconnect host: ")))
+  (angelia-client-disconnect host)
+  (angelia-client-connect host))
+
+(defun angelia-client-restart-server (host)
+  "Reconnect to HOST, forcing a re-upload of the server source first.
+Unlike `angelia-client-reconnect', the SHA1 check is bypassed so the
+embedded server.el is always re-deployed before the new connection starts.
+Use this to pick up local changes to the server source without incrementing
+the SHA1 manually, or to recover a host with a corrupted remote copy."
+  (interactive (list (angelia-client--read-host "Restart server on host: ")))
+  (angelia-client-disconnect host)
+  (angelia-client-deploy host 'force)
+  (angelia-client-connect host))
+
 (defun angelia-client-connection (host)
   "Return the live connection for HOST or signal `angelia-client-not-connected'."
   (or (angelia-client--existing-live-connection host)

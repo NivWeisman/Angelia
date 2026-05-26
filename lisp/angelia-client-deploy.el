@@ -211,14 +211,16 @@ SHA1 mismatch."
                     :got after)))
     (angelia-client--log "deploy: upload verified, sha1=%s" after)))
 
-(defun angelia-client-deploy (host)
+(defun angelia-client-deploy (host &optional force)
   "Ensure HOST has a current angelia-server.el deployed.
 Returns the absolute remote path to the server source.  Idempotent: when
 the remote SHA1 matches the embedded one this is a quick no-op probe.
+When FORCE is non-nil the SHA1 check is skipped and the source is always
+re-uploaded; use this to force a reload of the server after source changes.
 Signals `angelia-client-deploy-error' on any failure."
   (interactive "sHost: ")
-  (angelia-client--log "deploy: starting host=%s embedded-sha1=%s"
-                       host angelia-client--server-sha1)
+  (angelia-client--log "deploy: starting host=%s embedded-sha1=%s force=%s"
+                       host angelia-client--server-sha1 (and force t))
   ;; 1. Emacs >= 27 on remote.
   (angelia-client--remote-emacs-version host)
   ;; 2. Cache directory.
@@ -228,10 +230,10 @@ Signals `angelia-client-deploy-error' on any failure."
     (unless (zerop (plist-get res :exit))
       (angelia-client--deploy-error
        "Failed to create remote cache directory" host res)))
-  ;; 3. SHA1 probe -> short-circuit if cached copy is current.
-  (let ((remote-sha (angelia-client--remote-sha1 host)))
+  ;; 3. SHA1 probe -> short-circuit if cached copy is current (skipped when forced).
+  (let ((remote-sha (and (not force) (angelia-client--remote-sha1 host))))
     (angelia-client--log "deploy: remote sha1=%s embedded sha1=%s"
-                         (or remote-sha "<missing>")
+                         (or remote-sha (if force "<skipped>" "<missing>"))
                          angelia-client--server-sha1)
     (if (equal remote-sha angelia-client--server-sha1)
         (progn
