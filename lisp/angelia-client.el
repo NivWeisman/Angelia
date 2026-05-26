@@ -82,6 +82,8 @@ print to stdout and corrupt the protocol stream."
 (defun angelia-client--on-shutdown (host)
   "Run when the jsonrpc connection for HOST shuts down.  Drops it from the map."
   (angelia-client--log "shutdown callback fired for host=%s" host)
+  (when (fboundp 'angelia-client-lsp--cleanup-host)
+    (angelia-client-lsp--cleanup-host host))
   (when-let ((conn (gethash host angelia-client--connections)))
     (when (process-live-p (angelia-client--conn-process conn))
       (delete-process (angelia-client--conn-process conn))))
