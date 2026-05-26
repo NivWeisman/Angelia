@@ -40,6 +40,13 @@ Long-lived streaming methods (chunked file I/O, PTY, ...) allocate a row
 here and key all subsequent events on the returned id.  Per-feature state
 lives in the plist (e.g. (:kind read-stream :offset N :total M)).")
 
+(defvar angelia-server--proc-backends nil
+  "Alist of (NAME . `angelia-server--proc-backend' struct) for installed
+persistence backends.  Populated lazily by
+`angelia-server--init-proc-backends'; hoisted here so functions earlier
+in the file (e.g. `server/info') can reference it without a byte-compile
+warning.")
+
 (define-error 'angelia-server-protocol-error "Angelia server protocol error")
 
 ;; ---------------------------------------------------------------------------
@@ -332,7 +339,8 @@ CONN is the connection context, passed verbatim to every handler."
     h))
 
 (defun angelia-server--builtin-info (_conn _params)
-  "Reply with version + uptime + PID + hostname diagnostics."
+  "Reply with version + uptime + PID + hostname + available backends."
+  (angelia-server--init-proc-backends)
   (let ((h (make-hash-table :test #'equal)))
     (puthash "sha1" (or angelia-server--source-sha1 :null) h)
     (puthash "emacs_version" emacs-version h)
@@ -344,6 +352,9 @@ CONN is the connection context, passed verbatim to every handler."
                                  (time-subtract (current-time)
                                                 angelia-server--start-time))))
                0)
+             h)
+    (puthash "available_backends"
+             (vconcat (mapcar #'car angelia-server--proc-backends))
              h)
     h))
 
@@ -687,10 +698,29 @@ Returns `{session, pid}'.  Recognised params:
          (cwd  (and (hash-table-p params) (gethash "cwd" params)))
          (env  (and (hash-table-p params) (gethash "env" params)))
          (rows (and (hash-table-p params) (gethash "rows" params)))
-         (cols (and (hash-table-p params) (gethash "cols" params))))
+         (cols (and (hash-table-p params) (gethash "cols" params)))
+         (persist (and (hash-table-p params) (gethash "persist" params)))
+         (backend-name (and (hash-table-p params) (gethash "backend" params)))
+         (raw-argv (append argv nil))
+         (effective-backend nil))
     (unless (and (vectorp argv) (> (length argv) 0)
-                 (cl-every #'stringp (append argv nil)))
+                 (cl-every #'stringp raw-argv))
       (error "proc/start: `argv' must be a non-empty vector of strings"))
+    ;; If persistence was requested, swap argv for the backend-wrapped form.
+    (when (stringp persist)
+      (let* ((chosen-name (or backend-name
+                              (angelia-server--default-backend-name)))
+             (backend (and chosen-name
+                           (angelia-server--backend-by-name chosen-name))))
+        (unless backend
+          (error "proc/start: no persistence backend available (requested=%S, installed=%S)"
+                 backend-name
+                 (mapcar #'car (or angelia-server--proc-backends
+                                   (progn (angelia-server--init-proc-backends)
+                                          angelia-server--proc-backends)))))
+        (setq raw-argv (funcall (angelia-server--proc-backend-wrap-argv backend)
+                                raw-argv persist)
+              effective-backend chosen-name)))
     (let* ((session (angelia-server--make-session-id))
            (process-environment
             (if (hash-table-p env)
@@ -704,7 +734,7 @@ Returns `{session, pid}'.  Recognised params:
                                   default-directory))
            (proc (make-process
                   :name (format "angelia-pty-%s" session)
-                  :command (append argv nil)
+                  :command raw-argv
                   :coding 'binary
                   :connection-type 'pty
                   :noquery t
@@ -713,10 +743,13 @@ Returns `{session, pid}'.  Recognised params:
       (when (and (integerp rows) (integerp cols))
         (ignore-errors (set-process-window-size proc rows cols)))
       (angelia-server--register-session
-       session (list :kind 'proc :process proc))
+       session (list :kind 'proc :process proc
+                     :persist persist :backend effective-backend))
       (let ((result (make-hash-table :test #'equal)))
         (puthash "session" session result)
         (puthash "pid" (process-id proc) result)
+        (when effective-backend
+          (puthash "backend" effective-backend result))
         result))))
 
 (defun angelia-server--proc-input (_conn params)
@@ -756,10 +789,268 @@ Returns `{accepted: N}'."
     (signal-process (process-id (plist-get state :process)) (intern sig))
     (make-hash-table :test #'equal)))
 
-(angelia-server-register-method "proc/start"  #'angelia-server--proc-start)
-(angelia-server-register-method "proc/input"  #'angelia-server--proc-input)
-(angelia-server-register-method "proc/resize" #'angelia-server--proc-resize)
-(angelia-server-register-method "proc/signal" #'angelia-server--proc-signal)
+(defun angelia-server--proc-list-persisted (_conn params)
+  "Return `{sessions: [{name, backend, alive}, ...]}' across one/all backends."
+  (angelia-server--init-proc-backends)
+  (let* ((requested (and (hash-table-p params) (gethash "backend" params)))
+         (backends (if requested
+                       (let ((b (assoc requested angelia-server--proc-backends)))
+                         (and b (list b)))
+                     angelia-server--proc-backends))
+         (rows '()))
+    (dolist (entry backends)
+      (let ((name (car entry))
+            (b (cdr entry)))
+        (dolist (item (or (ignore-errors
+                            (funcall (angelia-server--proc-backend-list-fn b)))
+                          '()))
+          (let ((h (make-hash-table :test #'equal)))
+            (puthash "name" (car item) h)
+            (puthash "backend" name h)
+            (puthash "alive" (if (cadr item) t :false) h)
+            (push h rows)))))
+    (let ((result (make-hash-table :test #'equal)))
+      (puthash "sessions" (vconcat (nreverse rows)) result)
+      result)))
+
+(defun angelia-server--proc-reattach (conn params)
+  "Open a fresh PTY session re-entering the persisted PARAMS->name on BACKEND."
+  (let* ((name (and (hash-table-p params) (gethash "name" params)))
+         (backend-name (and (hash-table-p params) (gethash "backend" params)))
+         (backend (and backend-name
+                       (angelia-server--backend-by-name backend-name))))
+    (unless (stringp name)
+      (error "proc/reattach: missing string `name'"))
+    (unless backend
+      (error "proc/reattach: unknown backend: %S" backend-name))
+    (let* ((argv (funcall (angelia-server--proc-backend-reattach backend) name))
+           ;; Synthesize a `params' for proc/start that runs the reattach argv
+           ;; directly (already wrapped; do NOT re-wrap via persist).
+           (sub-params (make-hash-table :test #'equal)))
+      (puthash "argv" (vconcat argv) sub-params)
+      (let ((result (angelia-server--proc-start conn sub-params)))
+        ;; Annotate the response with the backend + persist name so the
+        ;; client can re-detach it later without remembering the original
+        ;; call.
+        (puthash "backend" backend-name result)
+        (puthash "persist" name result)
+        ;; Update the session row so cleanup/detach semantics behave
+        ;; like a persisted spawn.
+        (let* ((sid (gethash "session" result))
+               (state (gethash sid angelia-server--sessions)))
+          (when state
+            (puthash sid
+                     (plist-put (plist-put state :persist name)
+                                :backend backend-name)
+                     angelia-server--sessions)))
+        result))))
+
+(defun angelia-server--proc-detach (conn params)
+  "Close the local-side PTY session PARAMS->session, leaving the persisted
+process running.  Functionally identical to `session/close' -- the
+connector (dtach/tmux/screen client) dies; the wrapped program survives
+because it has been daemonised by its backend."
+  (angelia-server--builtin-session-close conn params))
+
+(defun angelia-server--proc-kill-persisted (_conn params)
+  "Tear down persisted PARAMS->name in PARAMS->backend (calls backend kill-fn)."
+  (let* ((name (and (hash-table-p params) (gethash "name" params)))
+         (backend-name (and (hash-table-p params) (gethash "backend" params)))
+         (backend (and backend-name
+                       (angelia-server--backend-by-name backend-name))))
+    (unless (stringp name)
+      (error "proc/kill-persisted: missing string `name'"))
+    (unless backend
+      (error "proc/kill-persisted: unknown backend: %S" backend-name))
+    (funcall (angelia-server--proc-backend-kill-fn backend) name)
+    (make-hash-table :test #'equal)))
+
+(angelia-server-register-method "proc/start"          #'angelia-server--proc-start)
+(angelia-server-register-method "proc/input"          #'angelia-server--proc-input)
+(angelia-server-register-method "proc/resize"         #'angelia-server--proc-resize)
+(angelia-server-register-method "proc/signal"         #'angelia-server--proc-signal)
+(angelia-server-register-method "proc/list-persisted" #'angelia-server--proc-list-persisted)
+(angelia-server-register-method "proc/reattach"       #'angelia-server--proc-reattach)
+(angelia-server-register-method "proc/detach"         #'angelia-server--proc-detach)
+(angelia-server-register-method "proc/kill-persisted" #'angelia-server--proc-kill-persisted)
+
+;; ---------------------------------------------------------------------------
+;; Process persistence -- pluggable dtach / tmux / screen backends.
+
+(cl-defstruct (angelia-server--proc-backend
+               (:constructor angelia-server--proc-backend-create))
+  "Pluggable interface for one persistence backend (dtach / tmux / screen).
+Each backend supplies a small set of pure-functional callbacks; the
+session-level code in `proc/start' calls `wrap-argv' to obtain the
+process command line, while `proc/list-persisted' / `proc/reattach' /
+`proc/kill-persisted' route through the other slots."
+  name              ; "dtach" / "tmux" / "screen"
+  binary            ; "dtach" / "tmux" / "screen"
+  wrap-argv         ; (lambda (argv name) -> wrapped argv list)
+  reattach          ; (lambda (name) -> argv list that re-enters)
+  list-fn           ; (lambda () -> list of (name alive-bool))
+  kill-fn)          ; (lambda (name) -> ignored)
+
+(defconst angelia-server--dtach-sock-dir
+  (expand-file-name "~/.cache/angelia/dtach")
+  "Directory holding the per-session dtach socket files.")
+
+(defun angelia-server--dtach-sock (name)
+  "Return the dtach socket path for persisted session NAME."
+  (expand-file-name (concat name ".sock") angelia-server--dtach-sock-dir))
+
+(defun angelia-server--make-backend-dtach ()
+  "Return the dtach backend struct."
+  (angelia-server--proc-backend-create
+   :name "dtach"
+   :binary "dtach"
+   :wrap-argv
+   (lambda (argv name)
+     (make-directory angelia-server--dtach-sock-dir t)
+     (append (list "dtach" "-A" (angelia-server--dtach-sock name)
+                   "-z" "-E" "-r" "winch")
+             argv))
+   :reattach
+   (lambda (name)
+     (list "dtach" "-a" (angelia-server--dtach-sock name) "-r" "winch"))
+   :list-fn
+   (lambda ()
+     (when (file-directory-p angelia-server--dtach-sock-dir)
+       (let (result)
+         (dolist (f (directory-files angelia-server--dtach-sock-dir
+                                     nil "\\.sock\\'"))
+           (push (list (file-name-sans-extension f) t) result))
+         result)))
+   :kill-fn
+   (lambda (name)
+     (let ((sock (angelia-server--dtach-sock name)))
+       ;; dtach has no built-in "kill session"; find the daemon that owns
+       ;; the socket by matching the command line, SIGTERM it, then remove
+       ;; the socket file.  pkill is on every POSIX-ish system we care
+       ;; about; if it isn't, the caller sees a non-zero exit and can
+       ;; clean up manually.
+       (when (file-exists-p sock)
+         (call-process "pkill" nil nil nil "-f"
+                       (regexp-quote sock))
+         (ignore-errors (delete-file sock)))
+       t))))
+
+(defun angelia-server--tmux-session-name (name)
+  "Return the tmux session name reserved for persisted NAME."
+  (concat "angelia-" name))
+
+(defun angelia-server--make-backend-tmux ()
+  "Return the tmux backend struct.
+The wrapper forces `TERM' to a known-good value because the server's
+inherited TERM is typically `dumb' (no terminfo entry), and tmux refuses
+to attach to a terminal it cannot clear."
+  (angelia-server--proc-backend-create
+   :name "tmux"
+   :binary "tmux"
+   :wrap-argv
+   (lambda (argv name)
+     (let ((sess (angelia-server--tmux-session-name name))
+           (cmd-str (mapconcat #'shell-quote-argument argv " ")))
+       (list "sh" "-c"
+             (format
+              "export TERM=${TERM:-xterm-256color}; tmux has-session -t %s 2>/dev/null || tmux new-session -d -s %s %s; exec tmux attach -t %s"
+              (shell-quote-argument sess)
+              (shell-quote-argument sess)
+              cmd-str
+              (shell-quote-argument sess)))))
+   :reattach
+   (lambda (name)
+     (list "sh" "-c"
+           (format "export TERM=${TERM:-xterm-256color}; exec tmux attach -t %s"
+                   (shell-quote-argument
+                    (angelia-server--tmux-session-name name)))))
+   :list-fn
+   (lambda ()
+     (let (result)
+       (with-temp-buffer
+         (when (zerop (call-process
+                       "tmux" nil t nil
+                       "list-sessions" "-F"
+                       "#{session_name}\t#{?session_attached,1,0}"))
+           (goto-char (point-min))
+           (while (re-search-forward "^angelia-\\([^\t]+\\)\t" nil t)
+             (push (list (match-string 1) t) result))))
+       result))
+   :kill-fn
+   (lambda (name)
+     (call-process "tmux" nil nil nil "kill-session" "-t"
+                   (angelia-server--tmux-session-name name)))))
+
+(defun angelia-server--screen-session-name (name)
+  "Return the screen session base name reserved for persisted NAME."
+  (concat "angelia-" name))
+
+(defun angelia-server--make-backend-screen ()
+  "Return the GNU screen backend struct.
+The wrapper forces `TERM' to a known-good value because the server's
+inherited TERM is typically `dumb', which screen cannot drive."
+  (angelia-server--proc-backend-create
+   :name "screen"
+   :binary "screen"
+   :wrap-argv
+   (lambda (argv name)
+     (let ((sess (angelia-server--screen-session-name name))
+           (cmd-str (mapconcat #'shell-quote-argument argv " ")))
+       (list "sh" "-c"
+             (format
+              "export TERM=${TERM:-xterm-256color}; screen -ls %s >/dev/null 2>&1 || screen -dmS %s %s; exec screen -x %s"
+              (shell-quote-argument sess)
+              (shell-quote-argument sess)
+              cmd-str
+              (shell-quote-argument sess)))))
+   :reattach
+   (lambda (name)
+     (list "sh" "-c"
+           (format "export TERM=${TERM:-xterm-256color}; exec screen -x %s"
+                   (shell-quote-argument
+                    (angelia-server--screen-session-name name)))))
+   :list-fn
+   (lambda ()
+     (let (result)
+       (with-temp-buffer
+         (call-process "screen" nil t nil "-ls")
+         (goto-char (point-min))
+         (while (re-search-forward
+                 "^[\t ]*\\(?:[0-9]+\\.\\)?angelia-\\([^[:space:]]+\\)"
+                 nil t)
+           (push (list (match-string 1) t) result)))
+       result))
+   :kill-fn
+   (lambda (name)
+     (call-process "screen" nil nil nil
+                   "-S" (angelia-server--screen-session-name name)
+                   "-X" "quit"))))
+
+(defun angelia-server--init-proc-backends ()
+  "Probe for dtach / tmux / screen and populate `angelia-server--proc-backends'.
+Idempotent; safe to call repeatedly."
+  (unless angelia-server--proc-backends
+    (dolist (mk (list (cons "dtach"  #'angelia-server--make-backend-dtach)
+                      (cons "tmux"   #'angelia-server--make-backend-tmux)
+                      (cons "screen" #'angelia-server--make-backend-screen)))
+      (let* ((name (car mk))
+             (b (funcall (cdr mk))))
+        (when (executable-find (angelia-server--proc-backend-binary b))
+          (push (cons name b) angelia-server--proc-backends))))
+    (setq angelia-server--proc-backends
+          (nreverse angelia-server--proc-backends))))
+
+(defun angelia-server--backend-by-name (name)
+  "Return the backend struct registered under NAME (a string), or nil."
+  (angelia-server--init-proc-backends)
+  (cdr (assoc name angelia-server--proc-backends)))
+
+(defun angelia-server--default-backend-name ()
+  "Return the name of the first available backend, dtach > tmux > screen."
+  (angelia-server--init-proc-backends)
+  (cl-some (lambda (n)
+             (and (assoc n angelia-server--proc-backends) n))
+           '("dtach" "tmux" "screen")))
 
 ;; ---------------------------------------------------------------------------
 ;; Entry point.
