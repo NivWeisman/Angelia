@@ -110,25 +110,26 @@ in-memory copy + hash diverge from the on-disk file."
 ;; aliases, jump hosts, custom ports, and key files all work transparently.
 
 (defun angelia-client--ssh-run (host args &optional stdin)
-  "Run `ssh HOST ARGS' synchronously, optionally feeding STDIN bytes.
-ARGS is a list of strings; each becomes one argv entry to `ssh', which means
-the remote shell receives them joined by spaces and tokenizes the result.
-Returns a plist (:exit N :stdout S :stderr S).  Captures stderr to a temp
-file so we can read it back as a string."
+  "Run `ssh HOST bash -c CMD' synchronously, optionally feeding STDIN bytes.
+ARGS is a list of strings joined into a single shell command and run under
+an explicit `bash -c' invocation, so the remote login shell's identity never
+matters.  Returns a plist (:exit N :stdout S :stderr S).  Captures stderr to
+a temp file so we can read it back as a string."
   (angelia-client--log "ssh %s: %s%s"
                        host (string-join args " ")
                        (if stdin (format " (+%d bytes stdin)" (length stdin)) ""))
-  (let* ((stderr-file (make-temp-file "angelia-ssh-stderr-"))
+  (let* ((cmd (format "bash -c %s" (shell-quote-argument (string-join args " "))))
+         (stderr-file (make-temp-file "angelia-ssh-stderr-"))
          (coding-system-for-write 'binary)
          (coding-system-for-read  'binary))
     (unwind-protect
         (with-temp-buffer
           (set-buffer-multibyte nil)
-          (let ((exit (apply #'call-process-region
-                             (or stdin "") nil
-                             "ssh" nil
-                             (list (current-buffer) stderr-file) nil
-                             host args)))
+          (let ((exit (call-process-region
+                       (or stdin "") nil
+                       "ssh" nil
+                       (list (current-buffer) stderr-file) nil
+                       host cmd)))
             (let ((stdout (buffer-string))
                   (stderr (with-temp-buffer
                             (set-buffer-multibyte nil)
