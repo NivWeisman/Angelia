@@ -210,7 +210,14 @@ Called from `angelia-server--end-session' before the row is removed."
     ('proc
      (let ((proc (plist-get state :process)))
        (when (and proc (process-live-p proc))
-         (ignore-errors (delete-process proc)))))))
+         (ignore-errors (delete-process proc)))))
+    ('proc-exec
+     (let ((proc (plist-get state :process))
+           (stderr-pipe (plist-get state :stderr-pipe)))
+       (when (and proc (process-live-p proc))
+         (ignore-errors (delete-process proc)))
+       (when (and stderr-pipe (process-live-p stderr-pipe))
+         (ignore-errors (delete-process stderr-pipe)))))))
 
 (defun angelia-server--end-session (conn session)
   "Emit a terminal `kind: \"end\"' event for SESSION and drop its state row.
@@ -628,16 +635,145 @@ Returns t."
     (delete-file path)
     t))
 
-(angelia-server-register-method "file/read"         #'angelia-server--file-read)
-(angelia-server-register-method "file/write-open"   #'angelia-server--file-write-open)
-(angelia-server-register-method "file/write-chunk"  #'angelia-server--file-write-chunk)
-(angelia-server-register-method "file/write-finish" #'angelia-server--file-write-finish)
-(angelia-server-register-method "file/exists"       #'angelia-server--file-exists)
-(angelia-server-register-method "file/directory-p"  #'angelia-server--file-directory-p)
-(angelia-server-register-method "file/attributes"   #'angelia-server--file-attributes)
-(angelia-server-register-method "file/list-dir"     #'angelia-server--file-list-dir)
-(angelia-server-register-method "file/mkdir"        #'angelia-server--file-mkdir)
-(angelia-server-register-method "file/delete"       #'angelia-server--file-delete)
+(defun angelia-server--file-delete-directory (_conn params)
+  "Delete the directory PARAMS->path.
+When PARAMS->recursive is non-nil and not `:false', also delete contents.
+Returns t."
+  (let ((path (angelia-server--require-string-path "file/delete-directory" params))
+        (recursive (and (hash-table-p params) (gethash "recursive" params))))
+    (delete-directory path (and recursive (not (eq recursive :false))))
+    t))
+
+(defun angelia-server--file-copy (_conn params)
+  "Copy PARAMS->from to PARAMS->to.
+PARAMS->ok-if-exists controls overwrite (default nil).  Returns t."
+  (let ((from (and (hash-table-p params) (gethash "from" params)))
+        (to (and (hash-table-p params) (gethash "to" params)))
+        (ok (and (hash-table-p params) (gethash "ok-if-exists" params))))
+    (unless (stringp from) (error "file/copy: missing string `from'"))
+    (unless (stringp to)   (error "file/copy: missing string `to'"))
+    (copy-file (expand-file-name from) (expand-file-name to)
+               (and ok (not (eq ok :false)))
+               t t t)
+    t))
+
+(defun angelia-server--file-rename (_conn params)
+  "Rename PARAMS->from to PARAMS->to.
+PARAMS->ok-if-exists controls overwrite (default nil).  Returns t."
+  (let ((from (and (hash-table-p params) (gethash "from" params)))
+        (to (and (hash-table-p params) (gethash "to" params)))
+        (ok (and (hash-table-p params) (gethash "ok-if-exists" params))))
+    (unless (stringp from) (error "file/rename: missing string `from'"))
+    (unless (stringp to)   (error "file/rename: missing string `to'"))
+    (rename-file (expand-file-name from) (expand-file-name to)
+                 (and ok (not (eq ok :false))))
+    t))
+
+(defun angelia-server--file-symlink-target (_conn params)
+  "Return the link target of PARAMS->path, or :null if PATH isn't a symlink."
+  (let* ((path (angelia-server--require-string-path "file/symlink-target" params))
+         (target (file-symlink-p path)))
+    (if (stringp target) target :null)))
+
+(defun angelia-server--file-make-symlink (_conn params)
+  "Create symlink at PARAMS->linkpath pointing to PARAMS->target.  Returns t."
+  (let ((target (and (hash-table-p params) (gethash "target" params)))
+        (linkpath (and (hash-table-p params) (gethash "linkpath" params)))
+        (ok (and (hash-table-p params) (gethash "ok-if-exists" params))))
+    (unless (and (stringp target) (stringp linkpath))
+      (error "file/symlink: missing string `target' or `linkpath'"))
+    (make-symbolic-link target (expand-file-name linkpath)
+                        (and ok (not (eq ok :false))))
+    t))
+
+(defun angelia-server--file-set-modes (_conn params)
+  "Set the file modes of PARAMS->path to PARAMS->mode (integer).  Returns t."
+  (let ((path (angelia-server--require-string-path "file/set-modes" params))
+        (mode (and (hash-table-p params) (gethash "mode" params))))
+    (unless (integerp mode)
+      (error "file/set-modes: missing integer `mode'"))
+    (set-file-modes path mode)
+    t))
+
+(defun angelia-server--file-set-times (_conn params)
+  "Set the mtime of PARAMS->path to PARAMS->time (seconds since epoch).
+nil time means now.  Returns t."
+  (let* ((path (angelia-server--require-string-path "file/set-times" params))
+         (time (and (hash-table-p params) (gethash "time" params)))
+         (time-val (cond ((or (null time) (eq time :null)) nil)
+                         ((numberp time) (seconds-to-time time))
+                         (t (error "file/set-times: time must be a number")))))
+    (set-file-times path time-val)
+    t))
+
+(defun angelia-server--file-writable-p (_conn params)
+  "Return t if PARAMS->path is writable (real `access(W_OK)' check)."
+  (let ((path (angelia-server--require-string-path "file/writable-p" params)))
+    (if (file-writable-p path) t nil)))
+
+(defun angelia-server--file-executable-p (_conn params)
+  "Return t if PARAMS->path is executable."
+  (let ((path (angelia-server--require-string-path "file/executable-p" params)))
+    (if (file-executable-p path) t nil)))
+
+(defun angelia-server--file-list-dir-attrs (_conn params)
+  "List PARAMS->path with full attributes per entry.
+Returns {entries: [{name, type, size, mode, mtime}, ...]}."
+  (let* ((path (angelia-server--require-string-path "file/list-dir-attrs" params))
+         (entries (directory-files-and-attributes path nil nil 'nosort 'string))
+         (result-entries
+          (mapcar
+           (lambda (e)
+             (let* ((name (car e))
+                    (attrs (cdr e))
+                    (h (make-hash-table :test #'equal)))
+               (puthash "name" name h)
+               (puthash "type"  (angelia-server--attr-type attrs) h)
+               (when (file-attribute-size attrs)
+                 (puthash "size" (file-attribute-size attrs) h))
+               (puthash "mode"  (file-attribute-modes attrs) h)
+               (puthash "mtime" (format-time-string
+                                 "%FT%T.%3N%z"
+                                 (file-attribute-modification-time attrs))
+                        h)
+               h))
+           entries))
+         (result (make-hash-table :test #'equal)))
+    (puthash "entries" (vconcat result-entries) result)
+    result))
+
+(defun angelia-server--file-completions (_conn params)
+  "Return `{names: [...]}' completion candidates against PARAMS->path.
+PARAMS->file is the prefix being completed (default \"\")."
+  (let* ((path (angelia-server--require-string-path "file/completions" params))
+         (file (or (and (hash-table-p params) (gethash "file" params)) ""))
+         (matches (file-name-all-completions
+                   file (file-name-as-directory path)))
+         (result (make-hash-table :test #'equal)))
+    (puthash "names" (vconcat matches) result)
+    result))
+
+(angelia-server-register-method "file/read"             #'angelia-server--file-read)
+(angelia-server-register-method "file/write-open"       #'angelia-server--file-write-open)
+(angelia-server-register-method "file/write-chunk"      #'angelia-server--file-write-chunk)
+(angelia-server-register-method "file/write-finish"     #'angelia-server--file-write-finish)
+(angelia-server-register-method "file/exists"           #'angelia-server--file-exists)
+(angelia-server-register-method "file/directory-p"      #'angelia-server--file-directory-p)
+(angelia-server-register-method "file/attributes"       #'angelia-server--file-attributes)
+(angelia-server-register-method "file/list-dir"         #'angelia-server--file-list-dir)
+(angelia-server-register-method "file/list-dir-attrs"   #'angelia-server--file-list-dir-attrs)
+(angelia-server-register-method "file/mkdir"            #'angelia-server--file-mkdir)
+(angelia-server-register-method "file/delete"           #'angelia-server--file-delete)
+(angelia-server-register-method "file/delete-directory" #'angelia-server--file-delete-directory)
+(angelia-server-register-method "file/copy"             #'angelia-server--file-copy)
+(angelia-server-register-method "file/rename"           #'angelia-server--file-rename)
+(angelia-server-register-method "file/symlink-target"   #'angelia-server--file-symlink-target)
+(angelia-server-register-method "file/symlink"          #'angelia-server--file-make-symlink)
+(angelia-server-register-method "file/set-modes"        #'angelia-server--file-set-modes)
+(angelia-server-register-method "file/set-times"        #'angelia-server--file-set-times)
+(angelia-server-register-method "file/writable-p"       #'angelia-server--file-writable-p)
+(angelia-server-register-method "file/executable-p"     #'angelia-server--file-executable-p)
+(angelia-server-register-method "file/completions"      #'angelia-server--file-completions)
 
 ;; ---------------------------------------------------------------------------
 ;; Remote process / PTY handlers.
@@ -879,7 +1015,124 @@ because it has been daemonised by its backend."
     (funcall (angelia-server--proc-backend-kill-fn backend) name)
     (make-hash-table :test #'equal)))
 
+(defun angelia-server--proc-exec (conn params)
+  "Spawn a non-PTY one-shot command on the remote and stream its output.
+PARAMS keys (all but `argv' optional):
+  argv   vector of strings -- argv[0] is the program, rest are args.
+  cwd    working directory.
+  env    hash-table of extra environment variables.
+  stdin  base64-encoded bytes written to the process's stdin and EOF'd.
+
+Returns `{session, pid}'.  Emits these `session/event' notifications:
+  kind=stdout {data: BASE64}
+  kind=stderr {data: BASE64}
+  kind=exit   {code: N|null, signal: STR|null, event: STR}
+and finally the terminal `kind=end' from `--end-session'.
+
+Modelled on `proc/start' but with `:connection-type 'pipe' so no PTY is
+allocated; stderr is captured via a `make-pipe-process' stderr sink so
+the two streams can be reported separately."
+  (let* ((argv (and (hash-table-p params) (gethash "argv" params)))
+         (cwd  (and (hash-table-p params) (gethash "cwd" params)))
+         (env  (and (hash-table-p params) (gethash "env" params)))
+         (stdin-b64 (and (hash-table-p params) (gethash "stdin" params)))
+         (raw-argv (append argv nil)))
+    (unless (and (vectorp argv) (> (length argv) 0)
+                 (cl-every #'stringp raw-argv))
+      (error "proc/exec: `argv' must be a non-empty vector of strings"))
+    (let* ((session (angelia-server--make-session-id))
+           (process-environment
+            (if (hash-table-p env)
+                (let ((envs (copy-sequence process-environment)))
+                  (maphash (lambda (k v)
+                             (push (format "%s=%s" k v) envs))
+                           env)
+                  envs)
+              process-environment))
+           (default-directory (or (and (stringp cwd)
+                                       (file-name-as-directory cwd))
+                                  default-directory))
+           (stderr-pipe
+            (make-pipe-process
+             :name (format "angelia-exec-stderr-%s" session)
+             :noquery t
+             :coding 'binary
+             :filter
+             (lambda (_p bytes)
+               (let ((p (make-hash-table :test #'equal)))
+                 (puthash "data" (base64-encode-string bytes t) p)
+                 (angelia-server--send-session-event
+                  conn session "stderr" p)))))
+           (proc
+            (make-process
+             :name (format "angelia-exec-%s" session)
+             :command raw-argv
+             :coding 'binary
+             :connection-type 'pipe
+             :noquery t
+             :stderr stderr-pipe
+             :filter
+             (lambda (_p bytes)
+               (let ((p (make-hash-table :test #'equal)))
+                 (puthash "data" (base64-encode-string bytes t) p)
+                 (angelia-server--send-session-event
+                  conn session "stdout" p)))
+             :sentinel
+             (lambda (p event)
+               (let ((status (process-status p)))
+                 (when (memq status '(exit signal failed closed))
+                   (let* ((exit-code (process-exit-status p))
+                          (signal-name
+                           (angelia-server--proc-extract-signal-name event))
+                          (payload (make-hash-table :test #'equal)))
+                     (puthash "code"
+                              (if (eq status 'exit) exit-code :null)
+                              payload)
+                     (puthash "signal" (or signal-name :null) payload)
+                     (puthash "event" (string-trim event) payload)
+                     (angelia-server--send-session-event
+                      conn session "exit" payload))
+                   (angelia-server--end-session conn session)))))))
+      (angelia-server--register-session
+       session (list :kind 'proc-exec
+                     :process proc
+                     :stderr-pipe stderr-pipe))
+      (when (stringp stdin-b64)
+        (let ((bytes (base64-decode-string stdin-b64)))
+          (when (> (length bytes) 0)
+            (process-send-string proc bytes)))
+        (process-send-eof proc))
+      (let ((result (make-hash-table :test #'equal)))
+        (puthash "session" session result)
+        (puthash "pid" (process-id proc) result)
+        result))))
+
+(defun angelia-server--proc-exec-stdin (_conn params)
+  "Write PARAMS->data (base64) to the stdin of PARAMS->session.
+Optional PARAMS->eof, when non-nil and not :false, sends EOF after the bytes.
+Returns `{accepted: N}'."
+  (let* ((session (and (hash-table-p params) (gethash "session" params)))
+         (state (and session (gethash session angelia-server--sessions)))
+         (b64 (and (hash-table-p params) (gethash "data" params)))
+         (eof (and (hash-table-p params) (gethash "eof" params))))
+    (unless (and state (eq (plist-get state :kind) 'proc-exec))
+      (error "proc/exec-stdin: unknown or wrong-kind session: %S" session))
+    (let ((proc (plist-get state :process))
+          (n 0))
+      (when (stringp b64)
+        (let ((bytes (base64-decode-string b64)))
+          (when (> (length bytes) 0)
+            (process-send-string proc bytes))
+          (setq n (length bytes))))
+      (when (and eof (not (eq eof :false)))
+        (process-send-eof proc))
+      (let ((h (make-hash-table :test #'equal)))
+        (puthash "accepted" n h)
+        h))))
+
 (angelia-server-register-method "proc/start"          #'angelia-server--proc-start)
+(angelia-server-register-method "proc/exec"           #'angelia-server--proc-exec)
+(angelia-server-register-method "proc/exec-stdin"     #'angelia-server--proc-exec-stdin)
 (angelia-server-register-method "proc/input"          #'angelia-server--proc-input)
 (angelia-server-register-method "proc/resize"         #'angelia-server--proc-resize)
 (angelia-server-register-method "proc/signal"         #'angelia-server--proc-signal)

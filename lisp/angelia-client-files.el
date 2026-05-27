@@ -15,6 +15,7 @@
 (require 'cl-lib)
 (require 'subr-x)
 (require 'angelia-client)
+(require 'angelia-client-proc)
 
 ;; ---------------------------------------------------------------------------
 ;; Path syntax.
@@ -254,6 +255,198 @@ so an absent key is the cleanest way to mean \"do not pass\"."
                        (angelia-client-files--params "path" remote))
   nil)
 
+(defun angelia-client-files--delete-directory (host remote recursive)
+  "Implement `delete-directory' for REMOTE on HOST."
+  (let ((p (angelia-client-files--params "path" remote)))
+    (when recursive (puthash "recursive" t p))
+    (angelia-client-call host 'file/delete-directory p)
+    nil))
+
+(defun angelia-client-files--two-path-op (method src-host src-rem dst args ok-idx)
+  "Run METHOD with `from'=SRC-REM and `to'=remote portion of DST on SRC-HOST.
+Both paths must live on the same host.  ARGS is the original argument list;
+OK-IDX is the index of the OK-IF-EXISTS argument in ARGS (e.g. 2 for
+`copy-file', 2 for `rename-file').  Returns nil."
+  (let* ((dst-parsed (angelia-client-files--parse dst))
+         (dst-host (car dst-parsed))
+         (dst-rem  (cdr dst-parsed))
+         (ok (nth ok-idx args)))
+    (unless dst-parsed
+      (error "angelia: cross-realm %s to non-angelia path not supported: %s"
+             method dst))
+    (unless (equal dst-host src-host)
+      (error "angelia: cross-host %s not supported (%s -> %s)"
+             method src-host dst-host))
+    (let ((p (make-hash-table :test #'equal)))
+      (puthash "from" src-rem p)
+      (puthash "to"   dst-rem p)
+      (when ok (puthash "ok-if-exists" t p))
+      (angelia-client-call src-host method p)
+      nil)))
+
+(defun angelia-client-files--directory-files-and-attributes (host remote args)
+  "Implement `directory-files-and-attributes' for REMOTE on HOST.
+ARGS is (DIRECTORY &optional FULL MATCH NOSORT ID-FORMAT COUNT)."
+  (let* ((directory (nth 0 args))
+         (full      (nth 1 args))
+         (match     (nth 2 args))
+         (nosort    (nth 3 args))
+         (resp (angelia-client-call
+                host 'file/list-dir-attrs
+                (angelia-client-files--params "path" remote)))
+         (entries (append (plist-get resp :entries) nil))
+         (filtered (if match
+                       (cl-remove-if-not
+                        (lambda (e) (string-match-p match (plist-get e :name)))
+                        entries)
+                     entries))
+         (sorted (if nosort filtered
+                   (sort filtered
+                         (lambda (a b)
+                           (string< (plist-get a :name)
+                                    (plist-get b :name))))))
+         (dir (if (string-suffix-p "/" directory)
+                  directory (concat directory "/"))))
+    (mapcar
+     (lambda (e)
+       (let* ((name (plist-get e :name))
+              (type (plist-get e :type))
+              (size (plist-get e :size))
+              (mode (plist-get e :mode))
+              (mtime-str (plist-get e :mtime))
+              (mtime (if mtime-str
+                         (ignore-errors (date-to-time mtime-str))
+                       '(0 0 0 0)))
+              (type-val (cond ((equal type "directory") t)
+                              ((equal type "symlink") "")
+                              (t nil)))
+              (path (if full (concat dir name) name)))
+         (cons path
+               (list type-val 1 0 0 mtime mtime mtime size mode nil 0 0))))
+     sorted)))
+
+(defun angelia-client-files--completions (host remote file)
+  "Return the list of completion candidates for FILE under REMOTE on HOST."
+  (let* ((p (angelia-client-files--params "path" remote "file" (or file ""))))
+    (let* ((resp (angelia-client-call host 'file/completions p))
+           (names (plist-get resp :names)))
+      (append names nil))))
+
+(defun angelia-client-files--file-modes (host remote)
+  "Implement `file-modes' for REMOTE on HOST -- returns an integer or nil."
+  (let ((attrs (angelia-client-files--file-attributes host remote)))
+    (when attrs
+      (let ((modes (nth 8 attrs)))
+        (and (stringp modes)
+             (file-modes-symbolic-to-number modes))))))
+
+(defun angelia-client-files--insert-directory (host remote args)
+  "Implement `insert-directory' by shelling out to ls on the remote.
+ARGS is the original (FILE SWITCHES &optional WILDCARD FULL-DIRECTORY-P)."
+  (let* ((_file (nth 0 args))
+         (switches (nth 1 args))
+         (_wildcard (nth 2 args))
+         (sw-list (cond ((listp switches) switches)
+                        ((stringp switches)
+                         (split-string-and-unquote switches))
+                        (t nil)))
+         (argv (append (list "ls") sw-list (list remote)))
+         (result (angelia-client--exec host argv)))
+    (insert (decode-coding-string (plist-get result :stdout) 'utf-8 t))
+    (let ((stderr (plist-get result :stderr)))
+      (when (and stderr (> (length stderr) 0))
+        (angelia-client--log "insert-directory stderr: %s"
+                             (angelia-client--truncate stderr 200))))))
+
+(defun angelia-client-files--resolve-bufferspec (buffer)
+  "Translate process-file's BUFFER spec into (STDOUT-BUF . STDERR-FILE)."
+  (cond
+   ((null buffer)              (cons nil nil))
+   ((eq buffer t)              (cons (current-buffer) nil))
+   ((eq buffer 0)              (cons nil nil))
+   ((bufferp buffer)           (cons buffer nil))
+   ((stringp buffer)           (cons (get-buffer-create buffer) nil))
+   ((consp buffer)
+    (let* ((sb (car buffer))
+           (eb (cadr buffer))
+           (so (cond ((null sb) nil)
+                     ((eq sb t) (current-buffer))
+                     ((bufferp sb) sb)
+                     ((stringp sb) (get-buffer-create sb))))
+           (se (cond ((null eb) nil)
+                     ((eq eb t) nil)            ; mix into stdout
+                     ((stringp eb) eb))))
+      (cons so se)))
+   (t (cons (current-buffer) nil))))
+
+(defun angelia-client-files--process-file (host remote-dir args)
+  "Implement `process-file' for an angelia `default-directory'.
+ARGS is (PROGRAM &optional INFILE BUFFER DISPLAY &rest CMDARGS)."
+  (let* ((program (nth 0 args))
+         (infile  (nth 1 args))
+         (buffer  (nth 2 args))
+         (_display (nth 3 args))
+         (cmdargs (nthcdr 4 args))
+         (stdin (cond
+                 ((null infile) nil)
+                 ((stringp infile)
+                  (with-temp-buffer
+                    (set-buffer-multibyte nil)
+                    (insert-file-contents-literally infile)
+                    (buffer-string)))
+                 ((consp infile)
+                  ;; (FILE) form means same as FILE; (FILE BEG END) is a buffer
+                  ;; range -- skip for now.
+                  (let ((f (car infile)))
+                    (when (stringp f)
+                      (with-temp-buffer
+                        (set-buffer-multibyte nil)
+                        (insert-file-contents-literally f)
+                        (buffer-string)))))
+                 (t nil)))
+         (dest (angelia-client-files--resolve-bufferspec buffer))
+         (out-buf (car dest))
+         (err-file (cdr dest))
+         (result (angelia-client--exec host (cons program cmdargs)
+                                       :cwd remote-dir
+                                       :stdin stdin))
+         (exit (plist-get result :exit))
+         (signal (plist-get result :signal))
+         (stdout (plist-get result :stdout))
+         (stderr (plist-get result :stderr)))
+    (when (and out-buf (> (length stdout) 0))
+      (with-current-buffer out-buf
+        (insert (decode-coding-string stdout 'utf-8 t))))
+    (cond
+     (err-file
+      (when (> (length stderr) 0)
+        (let ((coding-system-for-write 'binary))
+          (with-temp-buffer
+            (set-buffer-multibyte nil)
+            (insert stderr)
+            (write-region (point-min) (point-max) err-file nil 'silent)))))
+     ((and out-buf (not (consp buffer)) (> (length stderr) 0))
+      (with-current-buffer out-buf
+        (insert (decode-coding-string stderr 'utf-8 t)))))
+    (cond ((and signal (not (eq signal :null)))
+           (format "signal: %s" signal))
+          ((integerp exit) exit)
+          (t -1))))
+
+(defun angelia-client-files--start-file-process (host remote-dir args)
+  "Implement `start-file-process' for an angelia `default-directory'.
+ARGS is (NAME BUFFER PROGRAM &rest CMDARGS).  Returns a process object."
+  (let* ((name    (nth 0 args))
+         (buffer  (nth 1 args))
+         (program (nth 2 args))
+         (cmdargs (nthcdr 3 args))
+         (buf (cond ((null buffer) nil)
+                    ((bufferp buffer) buffer)
+                    ((stringp buffer) (get-buffer-create buffer))
+                    (t nil))))
+    (angelia-client--exec-async host (cons program cmdargs) buf name
+                                :cwd remote-dir)))
+
 ;; ---------------------------------------------------------------------------
 ;; Main dispatcher + registration.
 
@@ -296,15 +489,42 @@ Unrecognized operations fall through to the default handler chain."
                                          angelia-client-files--prefix a)))
                                  args))
          (parsed (and first-path (angelia-client-files--parse first-path)))
-         (host (car parsed))
-         (remote (cdr parsed)))
+         ;; A small set of operations carry no angelia path in `args' --
+         ;; they reach us only because `default-directory' is an angelia
+         ;; URL.  For those (and ONLY those) we resolve the connection via
+         ;; `default-directory'.  Path-arg ops must NOT fall through to
+         ;; `dd-parsed', or a probe like `(file-directory-p "/@angelia:H:")'
+         ;; (no path component) would send a nil `path' to the server.
+         (dd-op (memq operation
+                      '(process-file start-file-process shell-command
+                        temporary-file-directory
+                        unhandled-file-name-directory
+                        make-nearby-temp-file file-remote-p)))
+         (dd-parsed (and dd-op (not parsed)
+                         (stringp default-directory)
+                         (angelia-client-files--parse default-directory)))
+         (effective (or parsed dd-parsed))
+         (host (car effective))
+         (remote (cdr parsed))
+         (remote-dir (or remote (cdr dd-parsed))))
     (angelia-client--log
-     "file-handler op=%s path=%s host=%s remote=%s"
-     operation first-path host remote)
+     "file-handler op=%s path=%s host=%s remote=%s dd=%s"
+     operation first-path host remote default-directory)
     (cond
-     ((not parsed)
-      ;; No recognizable Angelia path in args -- delegate so the URL syntax
+     ((not effective)
+      ;; No recognizable Angelia path here -- delegate so the URL syntax
       ;; itself is parseable by ordinary code paths.
+      (angelia-client-files--default operation args))
+     ((and (not (memq operation
+                      '(process-file start-file-process shell-command
+                        temporary-file-directory
+                        unhandled-file-name-directory
+                        make-nearby-temp-file file-remote-p
+                        expand-file-name)))
+           (null remote))
+      ;; The path arg parsed only as far as `/@angelia:HOST:' with no
+      ;; remote component -- nothing useful to send.  Treat like
+      ;; \"directory above the root\" and delegate.
       (angelia-client-files--default operation args))
      ((progn (angelia-client-files--ensure-connection host) nil)
       ;; Unreachable; the form above is only here to gate every branch below
@@ -321,39 +541,136 @@ Unrecognized operations fall through to the default handler chain."
      ((eq operation 'file-readable-p)
       (angelia-client-files--rpc-bool host 'file/exists remote))
      ((eq operation 'file-writable-p)
-      ;; We don't have a remote-side `access(W_OK)' yet.  Assume writable
-      ;; when the path exists or its parent does; falling back to t is
-      ;; safer than nil because nil makes `find-file' silently mark the
-      ;; buffer read-only and breaks `save-buffer'.
-      t)
-     ((eq operation 'file-symlink-p) nil)
+      (angelia-client-files--rpc-bool host 'file/writable-p remote))
+     ((eq operation 'file-executable-p)
+      (angelia-client-files--rpc-bool host 'file/executable-p remote))
+     ((eq operation 'file-symlink-p)
+      (let ((resp (condition-case nil
+                      (angelia-client-call
+                       host 'file/symlink-target
+                       (angelia-client-files--params "path" remote))
+                    (error :null))))
+        (and (stringp resp) resp)))
      ((eq operation 'file-regular-p)
       (let ((attrs (angelia-client-files--file-attributes host remote)))
         (and attrs (null (car attrs)))))
      ((eq operation 'file-attributes)
       (angelia-client-files--file-attributes host remote))
+     ((eq operation 'file-modes)
+      (angelia-client-files--file-modes host remote))
+     ((eq operation 'set-file-modes)
+      (let ((mode (nth 1 args))
+            (p (angelia-client-files--params "path" remote)))
+        (when (integerp mode) (puthash "mode" mode p))
+        (angelia-client-call host 'file/set-modes p)
+        nil))
+     ((eq operation 'set-file-times)
+      (let* ((time (nth 1 args))
+             (epoch (and time (float-time time)))
+             (p (angelia-client-files--params "path" remote)))
+        (when (numberp epoch) (puthash "time" epoch p))
+        (angelia-client-call host 'file/set-times p)
+        nil))
      ((eq operation 'directory-files)
       (angelia-client-files--directory-files host remote args))
+     ((eq operation 'directory-files-and-attributes)
+      (angelia-client-files--directory-files-and-attributes host remote args))
+     ((eq operation 'file-name-all-completions)
+      (let ((file (nth 0 args)))
+        (angelia-client-files--completions host remote file)))
+     ((eq operation 'file-name-completion)
+      (let* ((file (nth 0 args))
+             (pred (nth 2 args))
+             (cands (angelia-client-files--completions host remote file)))
+        (try-completion file (mapcar #'list cands) pred)))
      ((eq operation 'make-directory)
       (angelia-client-files--make-directory host remote args))
      ((eq operation 'delete-file)
       (angelia-client-files--delete-file host remote))
+     ((eq operation 'delete-directory)
+      (angelia-client-files--delete-directory host remote (nth 1 args)))
+     ((eq operation 'copy-file)
+      (angelia-client-files--two-path-op
+       'file/copy host remote (nth 1 args) args 2))
+     ((eq operation 'rename-file)
+      (angelia-client-files--two-path-op
+       'file/rename host remote (nth 1 args) args 2))
+     ((eq operation 'make-symbolic-link)
+      (let* ((target (nth 0 args))
+             (link (nth 1 args))
+             (ok (nth 2 args))
+             (link-parsed (angelia-client-files--parse link))
+             (p (make-hash-table :test #'equal)))
+        (unless link-parsed
+          (error "angelia: link path must be an angelia URL"))
+        (puthash "target" target p)
+        (puthash "linkpath" (cdr link-parsed) p)
+        (when ok (puthash "ok-if-exists" t p))
+        (angelia-client-call (car link-parsed) 'file/symlink p)
+        nil))
+     ((eq operation 'insert-directory)
+      (angelia-client-files--insert-directory host remote args))
+     ((eq operation 'process-file)
+      (angelia-client-files--process-file host remote-dir args))
+     ((eq operation 'start-file-process)
+      (angelia-client-files--start-file-process host remote-dir args))
+     ((eq operation 'shell-command)
+      ;; Route shell-command via process-file using the user's `shell-file-name'
+      ;; on the remote.  Magit and many other packages rely on this.
+      (let* ((cmd (nth 0 args))
+             (out (nth 1 args))
+             (err (nth 2 args)))
+        (angelia-client-files--process-file
+         host remote-dir
+         (list shell-file-name nil (or out t) nil
+               shell-command-switch cmd))))
+     ((eq operation 'file-remote-p)
+      ;; Return the prefix that uniquely identifies the connection: magit
+      ;; uses this as a key to decide "is this remote at all and which one".
+      (concat angelia-client-files--prefix host ":"))
+     ((eq operation 'unhandled-file-name-directory)
+      ;; Some local routines need a chdir-able directory (dired does this
+      ;; for its buffer's `default-directory').  We don't have a remote
+      ;; chdir, but pointing at the local /tmp is what TRAMP does and works
+      ;; in practice -- the buffer's logical default-directory remains
+      ;; angelia, only the OS-level cwd of the process tree falls back.
+      temporary-file-directory)
+     ((eq operation 'temporary-file-directory)
+      (angelia-client-files--make-path host "/tmp/"))
+     ((eq operation 'make-nearby-temp-file)
+      ;; (make-nearby-temp-file PREFIX &optional DIR-FLAG SUFFIX) -- create
+      ;; a temp file living on the same host as the surrounding code so
+      ;; subsequent ops (chmod, rename) don't cross the boundary.
+      (let* ((prefix (nth 0 args))
+             (dir-flag (nth 1 args))
+             (suffix (nth 2 args))
+             (argv (append
+                    (list "mktemp")
+                    (when dir-flag (list "-d"))
+                    (list (concat "/tmp/" prefix "XXXXXX"
+                                  (or suffix "")))))
+             (result (angelia-client--exec host argv))
+             (name (string-trim (plist-get result :stdout))))
+        (angelia-client-files--make-path host name)))
      ((eq operation 'expand-file-name)
-      ;; (expand-file-name NAME &optional DIR).  Three shapes reach us:
+      ;; (expand-file-name NAME &optional DIR).  Shapes we handle:
       ;;   (a) NAME is an angelia URL                -> clean up its remote part
-      ;;   (b) NAME is plain, DIR is an angelia URL  -> resolve NAME against DIR
+      ;;   (b) NAME is relative, DIR is angelia URL  -> resolve NAME against DIR
       ;;       and re-wrap with the same host
-      ;;   (c) neither parses                        -> delegate (shouldn't
-      ;;       happen because our regexp only fires for angelia paths)
-      ;; The naive "return first-path" version was wrong for (b): with NAME
-      ;; relative the first matching arg is DIR, so callers like
-      ;; vc-cvs-registered's (expand-file-name "CVS" "/@angelia:HOST:/etc/")
-      ;; got the bare directory back and then tried to read it as a file.
+      ;;   (c) NAME is absolute non-angelia          -> delegate; absolute
+      ;;       local paths must stay local even when DIR is angelia, otherwise
+      ;;       Emacs's loader (autoload of `dired-aux' etc.) tries to read
+      ;;       `/@angelia:HOST:/usr/share/emacs/...' and signals file-missing.
+      ;;   (d) nothing angelia in either argument     -> delegate
       (let* ((name (nth 0 args))
              (dir  (or (nth 1 args) default-directory))
              (name-parsed (and (stringp name)
                                (angelia-client-files--parse name)))
+             (name-absolute-p (and (stringp name)
+                                   (> (length name) 0)
+                                   (eq (aref name 0) ?/)))
              (dir-parsed  (and (not name-parsed)
+                               (not name-absolute-p)
                                (stringp dir)
                                (angelia-client-files--parse dir))))
         (cond

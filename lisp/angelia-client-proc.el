@@ -363,6 +363,170 @@ underlying CMD alive only when there is one)."
     nil))
 
 ;; ---------------------------------------------------------------------------
+;; Non-PTY one-shot exec (sync + async).  Used by process-file /
+;; start-file-process / insert-directory in `angelia-client-files.el'.
+
+(defcustom angelia-client-exec-timeout 600
+  "Seconds before a synchronous `angelia-client--exec' gives up waiting."
+  :type 'integer
+  :group 'angelia)
+
+(cl-defun angelia-client--exec (host argv &key cwd env stdin timeout)
+  "Run ARGV on HOST without a PTY; return a plist (:exit N :stdout S :stderr S).
+ARGV is a list of strings.  CWD is the remote working directory.  ENV is a
+plist or alist of extra variables.  STDIN, when non-nil, is a string of
+bytes piped to the process's stdin.  Output is buffered and returned as
+unibyte strings; for unbounded output use the async path instead."
+  (let* ((conn (angelia-client-connection host))
+         (params (make-hash-table :test #'equal))
+         (stdout-acc '())
+         (stderr-acc '())
+         (exit-info nil))
+    (puthash "argv" (vconcat argv) params)
+    (when cwd (puthash "cwd" cwd params))
+    (when env
+      (let ((h (make-hash-table :test #'equal)))
+        (cl-loop for (k v) on env by #'cddr
+                 do (puthash (if (keywordp k) (substring (symbol-name k) 1) k)
+                             v h))
+        (puthash "env" h params)))
+    (when stdin
+      (let ((bytes (if (multibyte-string-p stdin)
+                       (encode-coding-string stdin 'utf-8 t)
+                     stdin)))
+        (puthash "stdin" (base64-encode-string bytes t) params)))
+    (let* ((result (jsonrpc-request (angelia-client--conn-jsonrpc conn)
+                                    'proc/exec params))
+           (session (plist-get result :session)))
+      (unless (stringp session)
+        (signal 'angelia-client-session-error
+                (list :host host :method 'proc/exec :result result)))
+      (puthash session
+               (list :on-event
+                     (lambda (kind p)
+                       (pcase kind
+                         ("stdout"
+                          (push (base64-decode-string (plist-get p :data))
+                                stdout-acc))
+                         ("stderr"
+                          (push (base64-decode-string (plist-get p :data))
+                                stderr-acc))
+                         ("exit"
+                          (setq exit-info
+                                (list :code (plist-get p :code)
+                                      :signal (plist-get p :signal)
+                                      :event (plist-get p :event))))))
+                     :on-end (lambda (_p)
+                               (unless exit-info
+                                 (setq exit-info '(:code nil :signal nil)))))
+               (angelia-client--conn-sessions conn))
+      (with-timeout ((or timeout angelia-client-exec-timeout)
+                     (angelia-client-close-session host session)
+                     (error "proc/exec timed out: %S" argv))
+        (while (null exit-info)
+          (accept-process-output nil 0.05)))
+      (let ((stdout (apply #'concat (nreverse stdout-acc)))
+            (stderr (apply #'concat (nreverse stderr-acc)))
+            (code (plist-get exit-info :code)))
+        (list :exit (cond ((integerp code) code)
+                          ((plist-get exit-info :signal) -1)
+                          (t -1))
+              :signal (plist-get exit-info :signal)
+              :stdout stdout
+              :stderr stderr)))))
+
+(cl-defun angelia-client--exec-async (host argv buffer name
+                                           &key cwd env filter sentinel
+                                           coding)
+  "Spawn ARGV on HOST asynchronously; return a process-like handle.
+The handle is a real `make-pipe-process' whose data is fed from remote
+session events.  FILTER and SENTINEL are wired exactly as on a local
+process: when bytes arrive we call FILTER (or the default inserter into
+BUFFER); on `exit' we call SENTINEL with a TRAMP/Emacs-shaped event
+string and delete the pipe (so `process-status' flips to closed and
+`process-exit-status' on it is meaningful)."
+  (let* ((conn (angelia-client-connection host))
+         (proc (make-pipe-process
+                :name name
+                :buffer buffer
+                :noquery t
+                :coding (or coding 'binary)))
+         (params (make-hash-table :test #'equal)))
+    (when filter (set-process-filter proc filter))
+    (when sentinel (set-process-sentinel proc sentinel))
+    (puthash "argv" (vconcat argv) params)
+    (when cwd (puthash "cwd" cwd params))
+    (when env
+      (let ((h (make-hash-table :test #'equal)))
+        (cl-loop for (k v) on env by #'cddr
+                 do (puthash (if (keywordp k) (substring (symbol-name k) 1) k)
+                             v h))
+        (puthash "env" h params)))
+    (let* ((result (jsonrpc-request (angelia-client--conn-jsonrpc conn)
+                                    'proc/exec params))
+           (session (plist-get result :session))
+           (pid (plist-get result :pid)))
+      (unless (stringp session)
+        (signal 'angelia-client-session-error
+                (list :host host :method 'proc/exec :result result)))
+      (process-put proc 'angelia-host host)
+      (process-put proc 'angelia-session session)
+      (process-put proc 'angelia-pid pid)
+      (puthash session
+               (list :on-event
+                     (lambda (kind p)
+                       (pcase kind
+                         ((or "stdout" "stderr")
+                          (let ((bytes (base64-decode-string
+                                        (plist-get p :data)))
+                                (f (process-filter proc)))
+                            (if f
+                                (condition-case err
+                                    (funcall f proc bytes)
+                                  (error
+                                   (angelia-client--log-error
+                                    "exec-async filter" err)))
+                              (let ((buf (process-buffer proc)))
+                                (when (buffer-live-p buf)
+                                  (with-current-buffer buf
+                                    (let ((m (process-mark proc)))
+                                      (save-excursion
+                                        (goto-char (or (marker-position m)
+                                                       (point-max)))
+                                        (insert bytes)
+                                        (set-marker m (point))))))))))
+                         ("exit"
+                          (let ((code (plist-get p :code))
+                                (sig  (plist-get p :signal))
+                                (s    (process-sentinel proc)))
+                            (process-put proc 'angelia-exit-code
+                                         (and (integerp code) code))
+                            (process-put proc 'angelia-signal sig)
+                            (when (process-live-p proc)
+                              (ignore-errors (delete-process proc)))
+                            (when s
+                              (let ((event
+                                     (cond ((and sig (not (eq sig :null)))
+                                            (format "signal %s\n" sig))
+                                           ((and (integerp code) (zerop code))
+                                            "finished\n")
+                                           (t
+                                            (format "exited abnormally with code %S\n"
+                                                    code)))))
+                                (condition-case err
+                                    (funcall s proc event)
+                                  (error
+                                   (angelia-client--log-error
+                                    "exec-async sentinel" err)))))))))
+                     :on-end (lambda (_p) nil))
+               (angelia-client--conn-sessions conn))
+      proc)))
+
+(defun angelia-client--exec-process-exit-status (proc)
+  "Return PROC's effective exit status (the one our sentinel recorded)."
+  (or (process-get proc 'angelia-exit-code) -1))
+
+;; ---------------------------------------------------------------------------
 ;; M-x angelia-client-list-persisted -- tabulated browser.
 
 (defvar-local angelia-client--lp-host nil
