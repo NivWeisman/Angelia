@@ -104,6 +104,25 @@ in-memory copy + hash diverge from the on-disk file."
   "Path on the remote host where the deployed server source is stored.")
 
 ;; ---------------------------------------------------------------------------
+;; SSH client program and POSIX quoting.
+
+(defcustom angelia-client-ssh-program "ssh"
+  "SSH client executable used for all Angelia connections.
+Override with an absolute path or alternate name (e.g. \"plink\") if the
+system `ssh' is not on PATH or a different client is preferred."
+  :type 'string
+  :group 'angelia)
+
+(defun angelia-client--unix-quote (s)
+  "Return S quoted for a POSIX remote shell, regardless of the local OS.
+Uses single-quote form so metacharacters like $, &, (, ) are never expanded
+before the remote bash receives the command.  Use this instead of
+`shell-quote-argument' for any string destined for a Unix remote host."
+  (if (string-match-p "[^a-zA-Z0-9_./-]" s)
+      (concat "'" (replace-regexp-in-string "'" "'\\''" s t t) "'")
+    s))
+
+;; ---------------------------------------------------------------------------
 ;; Synchronous SSH plumbing.
 ;;
 ;; HOST is passed straight to `ssh' as a single argument so ~/.ssh/config
@@ -118,7 +137,7 @@ a temp file so we can read it back as a string."
   (angelia-client--log "ssh %s: %s%s"
                        host (string-join args " ")
                        (if stdin (format " (+%d bytes stdin)" (length stdin)) ""))
-  (let* ((cmd (format "bash -c %s" (shell-quote-argument (string-join args " "))))
+  (let* ((cmd (format "bash -c %s" (angelia-client--unix-quote (string-join args " "))))
          (stderr-file (make-temp-file "angelia-ssh-stderr-"))
          (coding-system-for-write 'binary)
          (coding-system-for-read  'binary))
@@ -127,7 +146,7 @@ a temp file so we can read it back as a string."
           (set-buffer-multibyte nil)
           (let ((exit (call-process-region
                        (or stdin "") nil
-                       "ssh" nil
+                       angelia-client-ssh-program nil
                        (list (current-buffer) stderr-file) nil
                        host cmd)))
             (let ((stdout (buffer-string))
@@ -178,7 +197,7 @@ matches a real source -- so a `nil' return here is just a friendlier signal
 to the caller that a fresh upload is required."
   (let* ((res (angelia-client--ssh-run
                host
-               (list (format "cat %s 2>/dev/null | sha1sum"
+               (list (format "cat %s 2>/dev/null | if command -v sha1sum >/dev/null 2>&1; then sha1sum; else shasum; fi"
                              angelia-client--remote-server-path))))
          (out (plist-get res :stdout)))
     (when (string-match "^\\([0-9a-f]\\{40\\}\\)" out)

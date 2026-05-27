@@ -47,10 +47,22 @@ The notification dispatcher in `angelia-client-connect' uses it to route
 
 (defun angelia-client--ssh-args (host remote-path)
   "Build the argv list that launches the remote server on HOST.
-Uses `-Q' so that site-init / user customizations on the remote can never
-print to stdout and corrupt the protocol stream."
-  (list "ssh" host "emacs" "-Q" "--batch" "-l" remote-path
-        "-f" "angelia-server-main"))
+Creates a named FIFO on the remote, copies SSH stdin into it via a
+background `cat', then starts emacs reading from the FIFO via
+ANGELIA_STDIN_FIFO.  This avoids the Linux-only /proc/PID/fd/0 trick
+and works on macOS (and any POSIX host with mktemp + mkfifo)."
+  (let* ((emacs-cmd (concat "ANGELIA_STDIN_FIFO=\"$f\" "
+                            "emacs -Q --batch -l "
+                            remote-path   ; tilde path: must remain unquoted for bash expansion
+                            " -f angelia-server-main"))
+         ;; exec 3<&0 saves SSH stdin before bash nullifies it for background jobs.
+         ;; <&3 in the cat invocation is an explicit redirect that overrides the
+         ;; implicit /dev/null redirection bash applies to async commands.
+         (script    (concat "exec 3<&0; f=$(mktemp -u) && mkfifo -m 0600 \"$f\" && "
+                            "{ cat <&3 > \"$f\" 3<&- & } && exec 3<&- && "
+                            emacs-cmd "; rm -f \"$f\"")))
+    (list angelia-client-ssh-program host
+          (format "bash --login -c %s" (angelia-client--unix-quote script)))))
 
 (defun angelia-client--stderr-buffer-name (host)
   "Return the buffer name that captures the remote process's stderr for HOST."

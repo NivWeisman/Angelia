@@ -1069,11 +1069,19 @@ Idempotent; safe to call repeatedly."
 ;; ---------------------------------------------------------------------------
 ;; Entry point.
 
+(defun angelia-server--stdin-path ()
+  "Return a path that `cat' can open to read this server process's stdin.
+Checks ANGELIA_STDIN_FIFO first (set by the client's shell wrapper for macOS
+and other non-Linux hosts), then falls back to /proc/PID/fd/0 on Linux."
+  (or (getenv "ANGELIA_STDIN_FIFO")
+      (format "/proc/%d/fd/0" (emacs-pid))))
+
 (defun angelia-server-main ()
   "Entry point invoked from `emacs --batch -l server.el -f angelia-server-main'.
-Spawns a `cat' subprocess that reads our own stdin (via /proc/PID/fd/0) so we
-can drive an async event loop with `accept-process-output'.  Returns when
-stdin closes or `angelia-server--quit-flag' is set."
+Spawns a `cat' subprocess reading our stdin (via ANGELIA_STDIN_FIFO on macOS,
+/proc/PID/fd/0 on Linux) so we can drive an async event loop with
+`accept-process-output'.  Returns when stdin closes or `angelia-server--quit-flag'
+is set."
   (setq angelia-server--start-time (current-time)
         angelia-server--inbuf (unibyte-string)
         angelia-server--quit-flag nil)
@@ -1085,7 +1093,7 @@ stdin closes or `angelia-server--quit-flag' is set."
   (let* ((conn (angelia-server--conn-create))
          (proc (make-process
                 :name "angelia-stdin"
-                :command (list "cat" (format "/proc/%d/fd/0" (emacs-pid)))
+                :command (list "cat" (angelia-server--stdin-path))
                 :coding 'binary
                 :connection-type 'pipe
                 :noquery t

@@ -55,9 +55,9 @@ the user's default login shell first (loading env vars), then
   (angelia-client--log "lsp: spawn host=%s cmd=%s" host lsp-command)
   (make-process
    :name            (format "angelia-lsp<%s>" host)
-   :command         (list "ssh" host
+   :command         (list angelia-client-ssh-program host
                           (format "bash --login -c %s"
-                                  (shell-quote-argument lsp-command)))
+                                  (angelia-client--unix-quote lsp-command)))
    :connection-type 'pipe
    :coding          'binary
    :noquery         t))
@@ -167,9 +167,9 @@ when translating file:// URIs back to /@angelia: paths."
         :new-connection (lsp-stdio-connection
                          (let ((h host) (c lsp-command))
                            (lambda ()
-                             (list "ssh" h
+                             (list angelia-client-ssh-program h
                                    (format "bash --login -c %s"
-                                           (shell-quote-argument c))))))
+                                           (angelia-client--unix-quote c))))))
         :major-modes    (list mode)
         :priority       10
         :activation-fn  (let ((h host))
