@@ -390,10 +390,19 @@ contaminates the result."
           (setq proc
                 (make-process
                  :name "angelia-test-server"
-                 :command (list "emacs" "-Q" "--batch"
-                                "-L" angelia-tests--lisp-dir
-                                "-l" angelia-tests--server-source
-                                "-f" "angelia-server-main")
+                 ;; Use the same FIFO wrapper as angelia-client--ssh-args so the
+                 ;; test works on macOS (no /proc/PID/fd/0) and Linux alike.
+                 ;; exec 3<&0 saves bash's stdin (the pipe from make-process);
+                 ;; a background cat feeds it into a named FIFO; ANGELIA_STDIN_FIFO
+                 ;; tells the server to use that FIFO instead of /proc/PID/fd/0.
+                 :command (list "bash" "-c"
+                                (concat
+                                 "exec 3<&0; f=$(mktemp -u) && mkfifo -m 0600 \"$f\" && "
+                                 "{ cat <&3 >\"$f\" 3<&- & } && exec 3<&- && "
+                                 "ANGELIA_STDIN_FIFO=\"$f\" emacs -Q --batch"
+                                 " -L " (shell-quote-argument angelia-tests--lisp-dir)
+                                 " -l " (shell-quote-argument angelia-tests--server-source)
+                                 " -f angelia-server-main; rm -f \"$f\""))
                  :filter (lambda (_p out)
                            (setcar accumulator (concat (car accumulator) out)))
                  :stderr stderr-buf
