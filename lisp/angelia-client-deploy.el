@@ -129,15 +129,17 @@ before the remote bash receives the command.  Use this instead of
 ;; aliases, jump hosts, custom ports, and key files all work transparently.
 
 (defun angelia-client--ssh-run (host args &optional stdin)
-  "Run `ssh HOST bash -c CMD' synchronously, optionally feeding STDIN bytes.
+  "Run `ssh HOST bash --login -c CMD' synchronously, optionally feeding STDIN bytes.
 ARGS is a list of strings joined into a single shell command and run under
-an explicit `bash -c' invocation, so the remote login shell's identity never
-matters.  Returns a plist (:exit N :stdout S :stderr S).  Captures stderr to
-a temp file so we can read it back as a string."
+`bash --login -c' so that the remote login profiles are sourced.  This is
+required on macOS where tools like emacs are installed via Homebrew and only
+appear on PATH after ~/.bash_profile is loaded.  Returns a plist
+(:exit N :stdout S :stderr S).  Captures stderr to a temp file so we can
+read it back as a string."
   (angelia-client--log "ssh %s: %s%s"
                        host (string-join args " ")
                        (if stdin (format " (+%d bytes stdin)" (length stdin)) ""))
-  (let* ((cmd (format "bash -c %s" (angelia-client--unix-quote (string-join args " "))))
+  (let* ((cmd (format "bash --login -c %s" (angelia-client--unix-quote (string-join args " "))))
          (stderr-file (make-temp-file "angelia-ssh-stderr-"))
          (coding-system-for-write 'binary)
          (coding-system-for-read  'binary))
@@ -200,7 +202,7 @@ to the caller that a fresh upload is required."
                (list (format "cat %s 2>/dev/null | if command -v sha1sum >/dev/null 2>&1; then sha1sum; else shasum; fi"
                              angelia-client--remote-server-path))))
          (out (plist-get res :stdout)))
-    (when (string-match "^\\([0-9a-f]\\{40\\}\\)" out)
+    (when (string-match "\\([0-9a-f]\\{40\\}\\)" out)
       (let ((sha (match-string 1 out)))
         ;; SHA1 of empty input -- treat as "no real file there".
         (unless (equal sha "da39a3ee5e6b4b0d3255bfef95601890afd80709")
