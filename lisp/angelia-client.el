@@ -370,4 +370,10 @@ SUCCESS-FN is called with the result; optional ERROR-FN with the error plist."
     (let ((inhibit-read-only t)) (erase-buffer))))
 
 (provide 'angelia-client)
+
+;; Load the file-name-handler after provide to avoid a circular dependency:
+;; angelia-client-files requires angelia-client, so angelia-client must be in
+;; `features' before the sub-file is loaded.
+(require 'angelia-client-files)
+
 ;;; angelia-client.el ends here

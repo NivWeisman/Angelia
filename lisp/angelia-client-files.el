@@ -338,6 +338,16 @@ Unrecognized operations fall through to the default handler chain."
       (angelia-client-files--make-directory host remote args))
      ((eq operation 'delete-file)
       (angelia-client-files--delete-file host remote))
+     ((eq operation 'expand-file-name)
+      ;; Our paths are already fully-qualified absolute paths.  Returning the
+      ;; path unchanged is correct and prevents the default expand-file-name
+      ;; from stripping the `/@angelia:HOST:' prefix when it sees the embedded
+      ;; `:/' as a new absolute component.
+      first-path)
+     ((eq operation 'file-truename)
+      ;; Remote symlinks are not followed yet (no RPC for that).  Returning
+      ;; the path unchanged is safe; find-file will not second-guess it.
+      first-path)
      (t
       (angelia-client--log "file-handler delegating: %s" operation)
       (angelia-client-files--default operation args))))))) ; close outer cond
