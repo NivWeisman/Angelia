@@ -339,11 +339,36 @@ Unrecognized operations fall through to the default handler chain."
      ((eq operation 'delete-file)
       (angelia-client-files--delete-file host remote))
      ((eq operation 'expand-file-name)
-      ;; Our paths are already fully-qualified absolute paths.  Returning the
-      ;; path unchanged is correct and prevents the default expand-file-name
-      ;; from stripping the `/@angelia:HOST:' prefix when it sees the embedded
-      ;; `:/' as a new absolute component.
-      first-path)
+      ;; (expand-file-name NAME &optional DIR).  Three shapes reach us:
+      ;;   (a) NAME is an angelia URL                -> clean up its remote part
+      ;;   (b) NAME is plain, DIR is an angelia URL  -> resolve NAME against DIR
+      ;;       and re-wrap with the same host
+      ;;   (c) neither parses                        -> delegate (shouldn't
+      ;;       happen because our regexp only fires for angelia paths)
+      ;; The naive "return first-path" version was wrong for (b): with NAME
+      ;; relative the first matching arg is DIR, so callers like
+      ;; vc-cvs-registered's (expand-file-name "CVS" "/@angelia:HOST:/etc/")
+      ;; got the bare directory back and then tried to read it as a file.
+      (let* ((name (nth 0 args))
+             (dir  (or (nth 1 args) default-directory))
+             (name-parsed (and (stringp name)
+                               (angelia-client-files--parse name)))
+             (dir-parsed  (and (not name-parsed)
+                               (stringp dir)
+                               (angelia-client-files--parse dir))))
+        (cond
+         (name-parsed
+          (angelia-client-files--make-path
+           (car name-parsed)
+           (let ((default-directory "/"))
+             (expand-file-name (cdr name-parsed) "/"))))
+         (dir-parsed
+          (angelia-client-files--make-path
+           (car dir-parsed)
+           (let ((default-directory "/"))
+             (expand-file-name name (cdr dir-parsed)))))
+         (t
+          (angelia-client-files--default operation args)))))
      ((eq operation 'file-truename)
       ;; Remote symlinks are not followed yet (no RPC for that).  Returning
       ;; the path unchanged is safe; find-file will not second-guess it.
