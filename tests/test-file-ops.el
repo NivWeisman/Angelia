@@ -52,6 +52,29 @@
             (should (> (buffer-size) 0)))
         (kill-buffer buf)))))
 
+(ert-deftest test-find-file-remote-tilde ()
+  "Opening /@angelia:HOST:~/FILE reads the full file via remote tilde expansion.
+Regression: the URL regexp once required a leading `/' in the remote path, so a
+`~'-relative URL silently fell through to the local filesystem and produced an
+empty buffer.  The tilde must be resolved on the remote host."
+  (angelia-tests--file-ops-setup)
+  (with-angelia-connection angelia-tests--target-host _conn
+    ;; localhost: remote $HOME == ours, so we can place a real file under ~.
+    (let* ((name (format ".angelia-tilde-test-%d" (emacs-pid)))
+           (abs  (expand-file-name name "~/"))
+           (body "line-one\nline-two\nline-three\n"))
+      (unwind-protect
+          (progn
+            (angelia-tests-write-file abs body)
+            (let ((buf (find-file-noselect
+                        (concat "/@angelia:" angelia-tests--target-host ":~/" name))))
+              (unwind-protect
+                  (with-current-buffer buf
+                    (should (equal (buffer-string) body))
+                    (should (= 3 (count-lines (point-min) (point-max)))))
+                (kill-buffer buf))))
+        (when (file-exists-p abs) (delete-file abs))))))
+
 (ert-deftest test-save-file-remote ()
   "Open a remote temp file, modify it, save, re-read, verify the new content."
   (angelia-tests--file-ops-setup)

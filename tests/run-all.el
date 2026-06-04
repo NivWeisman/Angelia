@@ -44,6 +44,7 @@ Layer 2 covers all SSH-localhost integration tests: file ops + PTY procs
     (0 (angelia-tests--load-file "test-tempus.el")
        (angelia-tests--load-file "test-server-unit.el")
        (angelia-tests--load-file "test-client-deploy.el")
+       (angelia-tests--load-file "test-client-files-unit.el")
        (angelia-tests--load-file "test-lsp.el"))
     (1 (angelia-tests--load-file "test-transport.el"))
     (2 (angelia-tests--load-file "test-file-ops.el")

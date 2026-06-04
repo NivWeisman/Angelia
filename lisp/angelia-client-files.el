@@ -29,8 +29,10 @@
   "Path prefix that routes file operations through the Angelia handler.")
 
 (defconst angelia-client-files--regexp
-  "\\`/@angelia:\\(.+?\\):\\(/.*\\)\\'"
-  "Match `/@angelia:HOST:/path' and capture HOST + remote path.")
+  "\\`/@angelia:\\(.+?\\):\\([/~].*\\)\\'"
+  "Match `/@angelia:HOST:/path' and capture HOST + remote path.
+The remote path may be absolute (`/...') or home-relative (`~...', `~user/...');
+the tilde is resolved on the *remote* host, never locally.")
 
 (defun angelia-client-files--parse (path)
   "Return (HOST . REMOTE-PATH) for PATH or nil when it does not match."
@@ -41,6 +43,30 @@
 (defun angelia-client-files--make-path (host remote)
   "Compose an Angelia URL from HOST and REMOTE."
   (concat angelia-client-files--prefix host ":" remote))
+
+(defun angelia-client-files--normalize-remote (remote)
+  "Normalize a REMOTE path for re-wrapping into an Angelia URL.
+Absolute (`/...') paths are cleaned with `expand-file-name' against `/' so
+`.'/`..' collapse.  Home-relative (`~...') paths are returned untouched: the
+tilde must be expanded by the *remote* host, whose $HOME may differ from ours,
+so we never run them through the local `expand-file-name'."
+  (if (string-prefix-p "~" remote)
+      remote
+    (let ((default-directory "/"))
+      (expand-file-name remote "/"))))
+
+(defun angelia-client-files--join-remote (name dir-remote)
+  "Resolve relative NAME against remote directory DIR-REMOTE, tilde-preserving.
+When DIR-REMOTE is home-relative (`~...'), the leading tilde segment is held out
+of the local `expand-file-name' join and re-prepended, so the remote host -- not
+ours -- resolves it."
+  (let ((default-directory "/"))
+    (if (string-prefix-p "~" dir-remote)
+        (let* ((slash (string-match "/" dir-remote))
+               (tilde (if slash (substring dir-remote 0 slash) dir-remote))
+               (base  (if slash (substring dir-remote slash) "/")))
+          (concat tilde (expand-file-name name base)))
+      (expand-file-name name dir-remote))))
 
 ;; ---------------------------------------------------------------------------
 ;; Hash-table helpers (params always go up as hash-tables).
@@ -677,13 +703,11 @@ Unrecognized operations fall through to the default handler chain."
          (name-parsed
           (angelia-client-files--make-path
            (car name-parsed)
-           (let ((default-directory "/"))
-             (expand-file-name (cdr name-parsed) "/"))))
+           (angelia-client-files--normalize-remote (cdr name-parsed))))
          (dir-parsed
           (angelia-client-files--make-path
            (car dir-parsed)
-           (let ((default-directory "/"))
-             (expand-file-name name (cdr dir-parsed)))))
+           (angelia-client-files--join-remote name (cdr dir-parsed))))
          (t
           (angelia-client-files--default operation args)))))
      ((eq operation 'file-truename)
