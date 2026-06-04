@@ -14,6 +14,7 @@
 
 (require 'cl-lib)
 (require 'subr-x)
+(require 'tempus)
 
 ;; ---------------------------------------------------------------------------
 ;; Forward declarations.
@@ -56,6 +57,9 @@
   "Log a `condition-case' error ERR from context string WHERE."
   (angelia-client--log "%s ERROR %S: %s"
                        where (car err) (error-message-string err)))
+
+;; Route Tempus timing lines into the client debug buffer.
+(setq tempus-log-function #'angelia-client--log)
 
 (defun angelia-client--truncate (s n)
   "Return S truncated to N characters with an ellipsis when clipped."
@@ -113,6 +117,25 @@ system `ssh' is not on PATH or a different client is preferred."
   :type 'string
   :group 'angelia)
 
+(defcustom angelia-client-debug nil
+  "When non-nil, Angelia logs per-task timings (via Tempus) locally and remotely.
+Setting this drives `tempus-debug' locally and propagates ANGELIA_DEBUG=1 to the
+remote server (see `angelia-client--ssh-args'), so its handlers time too."
+  :type 'boolean
+  :group 'angelia
+  :set (lambda (sym val) (set-default sym val) (setq tempus-debug val)))
+
+(defcustom angelia-client-simulated-delay-ms 0
+  "Artificial per-response delay (ms) to request from the remote server.
+A testing aid: when >0 the client launches the server with ANGELIA_DELAY_MS set,
+so even a localhost connection mimics real network latency (visible in Tempus
+round-trip timings).  0 disables.  Takes effect on the next connect."
+  :type 'integer
+  :group 'angelia)
+
+;; Keep `tempus-debug' in sync for callers that `setq' the flag directly.
+(setq tempus-debug angelia-client-debug)
+
 (defun angelia-client--unix-quote (s)
   "Return S quoted for a POSIX remote shell, regardless of the local OS.
 Uses single-quote form so metacharacters like $, &, (, ) are never expanded
@@ -127,20 +150,24 @@ before the remote bash receives the command.  Use this instead of
 ;;
 ;; HOST is passed straight to `ssh' as a single argument so ~/.ssh/config
 ;; aliases, jump hosts, custom ports, and key files all work transparently.
+;;
+;; `ssh HOST CMD' runs CMD under the remote user's *default* login shell (its
+;; `-c').  We need a bash-loaded *login* environment (so PATH finds emacs, etc.)
+;; but our scripts are bash-specific, so the default shell must first source its
+;; own login files and then hand off to bash -- see `angelia-client--login-wrap'.
 
-(defun angelia-client--ssh-run (host args &optional stdin)
-  "Run `ssh HOST bash --login -c CMD' synchronously, optionally feeding STDIN bytes.
-ARGS is a list of strings joined into a single shell command and run under
-`bash --login -c' so that the remote login profiles are sourced.  This is
-required on macOS where tools like emacs are installed via Homebrew and only
-appear on PATH after ~/.bash_profile is loaded.  Returns a plist
-(:exit N :stdout S :stderr S).  Captures stderr to a temp file so we can
-read it back as a string."
+(defvar angelia-client--remote-shell-family (make-hash-table :test #'equal)
+  "Cache of HOST -> remote default-shell family symbol (`csh' or `sh').")
+
+(defun angelia-client--ssh-run-raw (host command &optional stdin)
+  "Run COMMAND on HOST via ssh with NO login-shell wrapping.
+COMMAND is a single string handed to the remote default shell (its `-c'),
+optionally fed STDIN bytes.  Returns a plist (:exit N :stdout S :stderr S);
+captures stderr to a temp file so we can read it back as a string."
   (angelia-client--log "ssh %s: %s%s"
-                       host (string-join args " ")
+                       host command
                        (if stdin (format " (+%d bytes stdin)" (length stdin)) ""))
-  (let* ((cmd (format "bash --login -c %s" (angelia-client--unix-quote (string-join args " "))))
-         (stderr-file (make-temp-file "angelia-ssh-stderr-"))
+  (let* ((stderr-file (make-temp-file "angelia-ssh-stderr-"))
          (coding-system-for-write 'binary)
          (coding-system-for-read  'binary))
     (unwind-protect
@@ -150,7 +177,7 @@ read it back as a string."
                        (or stdin "") nil
                        angelia-client-ssh-program nil
                        (list (current-buffer) stderr-file) nil
-                       host cmd)))
+                       host command)))
             (let ((stdout (buffer-string))
                   (stderr (with-temp-buffer
                             (set-buffer-multibyte nil)
@@ -164,6 +191,43 @@ read it back as a string."
                (angelia-client--truncate stderr 200))
               (list :exit exit :stdout stdout :stderr stderr))))
       (when (file-exists-p stderr-file) (delete-file stderr-file)))))
+
+(defun angelia-client--detect-shell-family (host)
+  "Return HOST's remote default-shell family: `csh' or `sh' (cached per HOST).
+Probes $SHELL with a bare command that needs no login environment, so it works
+even before PATH is set up.  Anything whose basename ends in `csh' (csh, tcsh)
+is treated as csh-family; everything else (bash, zsh, ksh, sh, ...) as sh."
+  (or (gethash host angelia-client--remote-shell-family)
+      (let* ((res (angelia-client--ssh-run-raw host "echo \"$SHELL\""))
+             (out (string-trim (or (plist-get res :stdout) "")))
+             (family (if (string-match-p "csh\\'" out) 'csh 'sh)))
+        (angelia-client--log "shell: host=%s $SHELL=%S family=%s" host out family)
+        (puthash host family angelia-client--remote-shell-family)
+        family)))
+
+(defun angelia-client--login-wrap (host bash-command)
+  "Return the remote command string that runs BASH-COMMAND under HOST's login env.
+For csh-family default shells (csh/tcsh) the shell sources its login files --
+including /etc/csh.login, which on macOS runs path_helper to populate PATH --
+then execs bash to run BASH-COMMAND.  For sh-family shells we rely on bash's own
+`--login'.  BASH-COMMAND must contain no single quotes (csh single-quoting is
+literal and cannot embed them); all current callers satisfy this."
+  (if (eq (angelia-client--detect-shell-family host) 'csh)
+      (concat
+       "if ( -e /etc/csh.login ) source /etc/csh.login >& /dev/null; "
+       "if ( -e ~/.login ) source ~/.login >& /dev/null; "
+       "exec bash -c " (angelia-client--unix-quote bash-command))
+    (concat "bash --login -c " (angelia-client--unix-quote bash-command))))
+
+(defun angelia-client--ssh-run (host args &optional stdin)
+  "Run ARGS (joined into one command) on HOST under its remote LOGIN environment.
+The remote login shell sources its profile (so PATH etc. match an interactive
+login) before bash executes the command; see `angelia-client--login-wrap'.
+Optionally feeds STDIN bytes.  Returns a plist (:exit N :stdout S :stderr S)."
+  (angelia-client--ssh-run-raw
+   host
+   (angelia-client--login-wrap host (string-join args " "))
+   stdin))
 
 (defun angelia-client--deploy-error (msg host res &rest extra)
   "Signal a deploy error with MSG, HOST, the result plist RES, and EXTRA fields."

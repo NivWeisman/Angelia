@@ -34,6 +34,12 @@
 (defvar angelia-server--start-time nil
   "Wall-clock time at which the server entered `angelia-server-main'.")
 
+(defvar angelia-server--response-delay-ms 0
+  "Artificial per-response delay in milliseconds, for simulating a slow link.
+Set from the ANGELIA_DELAY_MS env var in `angelia-server-main'; 0 disables.
+Purely a testing aid -- it lets a localhost connection mimic real latency so
+Tempus round-trip numbers look like a remote host.")
+
 (defvar angelia-server--sessions (make-hash-table :test #'equal)
   "Server-global session registry: session-id (string) -> state plist.
 Long-lived streaming methods (chunked file I/O, PTY, ...) allocate a row
@@ -74,6 +80,41 @@ warning.")
 (defun angelia-server--truncate (s n)
   "Return S clipped to at most N characters, with an ellipsis when clipped."
   (if (<= (length s) n) s (concat (substring s 0 n) "…")))
+
+;; ---------------------------------------------------------------------------
+;; Tempus -- debug-gated timing.  Inlined copy of lisp/tempus.el: the server is
+;; deployed as a single file (one SHA1 handshake), so we cannot `require' the
+;; standalone package on the remote.  Keep this in sync with lisp/tempus.el.
+;; `tempus-debug' is wired from ANGELIA_DEBUG and `tempus-log-function' to
+;; `angelia-server--log' in `angelia-server-main'.
+
+(defvar tempus-debug nil
+  "When non-nil, `tempus-measure' logs elapsed timings; otherwise zero overhead.")
+
+(defvar tempus-log-function #'ignore
+  "Function emitting one timing line.
+Called as (apply tempus-log-function FMT ARGS).")
+
+(defun tempus-log-since (label start)
+  "Log the elapsed ms since START (a time value) under LABEL, if `tempus-debug'."
+  (when tempus-debug
+    (apply tempus-log-function
+           "tempus %s | %.1f ms"
+           (list label
+                 (* 1000 (float-time (time-subtract (current-time) start)))))))
+
+(defmacro tempus-measure (label &rest body)
+  "Evaluate BODY once and return its value.
+When `tempus-debug' is non-nil, log the time BODY took (ms) via
+`tempus-log-function', keyed by LABEL.  Recorded even on non-local exit."
+  (declare (indent 1) (debug (form body)))
+  (let ((t0 (gensym "t0-"))
+        (lbl (gensym "lbl-")))
+    `(let ((,t0 (current-time))
+           (,lbl ,label))
+       (unwind-protect
+           (progn ,@body)
+         (tempus-log-since ,lbl ,t0)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Connection context + method registry.
@@ -237,6 +278,19 @@ no-op."
 ;; ---------------------------------------------------------------------------
 ;; Dispatch.
 
+(defun angelia-server--parse-delay-ms (s)
+  "Parse env string S into a non-negative response delay in ms.
+Returns 0 when S is nil, blank, or not a positive number."
+  (let ((n (and s (string-to-number s))))
+    (if (and n (> n 0)) n 0)))
+
+(defun angelia-server--simulate-delay ()
+  "Block for `angelia-server--response-delay-ms' ms to mimic connection latency.
+No-op when the delay is 0.  Called once per request in
+`angelia-server--dispatch', so every response is held back as on a slow link."
+  (when (> angelia-server--response-delay-ms 0)
+    (sleep-for (/ angelia-server--response-delay-ms 1000.0))))
+
 (defun angelia-server--dispatch (conn frame)
   "Dispatch FRAME (a parsed JSON-RPC envelope) through the method registry.
 CONN is the connection context, passed verbatim to every handler."
@@ -246,6 +300,10 @@ CONN is the connection context, passed verbatim to every handler."
          (handler (and method (gethash method angelia-server--methods))))
     (angelia-server--log "dispatch: method=%S id=%S handler=%S"
                          method id (and handler t))
+    ;; Simulate connection latency before any response is produced.  Sits
+    ;; outside the handler's `tempus-measure' below, so server-side handler
+    ;; timing stays honest while the client's round-trip reflects the delay.
+    (angelia-server--simulate-delay)
     (cond
      ((not (stringp method))
       (when (angelia-server--has-id-p id)
@@ -258,21 +316,18 @@ CONN is the connection context, passed verbatim to every handler."
          (angelia-server--make-error id -32601
                                      (format "Method not found: %s" method)))))
      (t
-      (let ((t0 (current-time)))
-        (condition-case err
-            (let ((result (funcall handler conn params)))
-              (angelia-server--log "handler %s ok in %.1f ms" method
-                                   (* 1000 (float-time
-                                            (time-subtract (current-time) t0))))
-              (when (angelia-server--has-id-p id)
-                (angelia-server--write-frame
-                 (angelia-server--make-result id result))))
-          (error
-           (angelia-server--log-error err)
-           (when (angelia-server--has-id-p id)
-             (angelia-server--write-frame
-              (angelia-server--make-error id -32603
-                                          (error-message-string err)))))))))))
+      (condition-case err
+          (let ((result (tempus-measure method
+                          (funcall handler conn params))))
+            (when (angelia-server--has-id-p id)
+              (angelia-server--write-frame
+               (angelia-server--make-result id result))))
+        (error
+         (angelia-server--log-error err)
+         (when (angelia-server--has-id-p id)
+           (angelia-server--write-frame
+            (angelia-server--make-error id -32603
+                                        (error-message-string err))))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Process filter (binds stdin bytes -> dispatch).
@@ -1337,12 +1392,18 @@ Spawns a `cat' subprocess reading our stdin (via ANGELIA_STDIN_FIFO on macOS,
 is set."
   (setq angelia-server--start-time (current-time)
         angelia-server--inbuf (unibyte-string)
-        angelia-server--quit-flag nil)
-  (angelia-server--log "startup: pid=%d sha1=%s emacs=%s host=%s"
+        angelia-server--quit-flag nil
+        tempus-debug (and (getenv "ANGELIA_DEBUG") t)
+        tempus-log-function #'angelia-server--log
+        angelia-server--response-delay-ms
+        (angelia-server--parse-delay-ms (getenv "ANGELIA_DELAY_MS")))
+  (angelia-server--log "startup: pid=%d sha1=%s emacs=%s host=%s debug=%s delay=%dms"
                        (emacs-pid)
                        (or angelia-server--source-sha1 "<unknown>")
                        emacs-version
-                       (or (system-name) "?"))
+                       (or (system-name) "?")
+                       tempus-debug
+                       angelia-server--response-delay-ms)
   (let* ((conn (angelia-server--conn-create))
          (proc (make-process
                 :name "angelia-stdin"

@@ -50,8 +50,15 @@ The notification dispatcher in `angelia-client-connect' uses it to route
 Creates a named FIFO on the remote, copies SSH stdin into it via a
 background `cat', then starts emacs reading from the FIFO via
 ANGELIA_STDIN_FIFO.  This avoids the Linux-only /proc/PID/fd/0 trick
-and works on macOS (and any POSIX host with mktemp + mkfifo)."
-  (let* ((emacs-cmd (concat "ANGELIA_STDIN_FIFO=\"$f\" "
+and works on macOS (and any POSIX host with mktemp + mkfifo).
+The whole script runs under the remote login environment regardless of the
+default login shell (csh/tcsh included); see `angelia-client--login-wrap'."
+  (let* ((emacs-cmd (concat (if angelia-client-debug "ANGELIA_DEBUG=1 " "")
+                            (if (> angelia-client-simulated-delay-ms 0)
+                                (format "ANGELIA_DELAY_MS=%d "
+                                        angelia-client-simulated-delay-ms)
+                              "")
+                            "ANGELIA_STDIN_FIFO=\"$f\" "
                             "emacs -Q --batch -l "
                             remote-path   ; tilde path: must remain unquoted for bash expansion
                             " -f angelia-server-main"))
@@ -62,7 +69,7 @@ and works on macOS (and any POSIX host with mktemp + mkfifo)."
                             "{ cat <&3 > \"$f\" 3<&- & } && exec 3<&- && "
                             emacs-cmd "; rm -f \"$f\"")))
     (list angelia-client-ssh-program host
-          (format "bash --login -c %s" (angelia-client--unix-quote script)))))
+          (angelia-client--login-wrap host script))))
 
 (defun angelia-client--stderr-buffer-name (host)
   "Return the buffer name that captures the remote process's stderr for HOST."
@@ -156,12 +163,11 @@ on transport / handshake failure (cleaning up the dead process first)."
               (puthash host conn angelia-client--connections)
               ;; Handshake.  jsonrpc.el decodes results as plists with
               ;; keyword keys (`:sha1', `:emacs_version', etc.).
-              (let* ((t0 (current-time))
-                     (resp (jsonrpc-request jrpc 'server/version nil :timeout 10))
+              (let* ((resp (tempus-measure (format "client handshake server/version on %s" host)
+                             (jsonrpc-request jrpc 'server/version nil :timeout 10)))
                      (remote-sha (plist-get resp :sha1)))
                 (angelia-client--log
-                 "handshake: %.1f ms remote-sha=%s embedded-sha=%s"
-                 (* 1000 (float-time (time-subtract (current-time) t0)))
+                 "handshake: remote-sha=%s embedded-sha=%s"
                  remote-sha angelia-client--server-sha1)
                 (unless (equal remote-sha angelia-client--server-sha1)
                   (signal 'angelia-client-version-mismatch
@@ -310,27 +316,35 @@ if the server's response lacks a session id."
   "Synchronously call METHOD on HOST with PARAMS.  Returns the result.
 TIMEOUT is seconds (default 30)."
   (let* ((conn (angelia-client-connection host))
-         (id-buf (angelia-client--truncate (format "%S" params) 200))
-         (t0 (current-time)))
+         (id-buf (angelia-client--truncate (format "%S" params) 200)))
     (angelia-client--log "call %s on %s params=%s" method host id-buf)
-    (let* ((resp (jsonrpc-request (angelia-client--conn-jsonrpc conn)
-                                  method params
-                                  :timeout (or timeout 30)))
-           (elapsed (* 1000 (float-time (time-subtract (current-time) t0)))))
-      (angelia-client--log "call %s on %s ok %.1f ms result=%s"
-                           method host elapsed
+    (let ((resp (tempus-measure (format "client call %s on %s" method host)
+                  (jsonrpc-request (angelia-client--conn-jsonrpc conn)
+                                   method params
+                                   :timeout (or timeout 30)))))
+      (angelia-client--log "call %s on %s ok result=%s"
+                           method host
                            (angelia-client--truncate (format "%S" resp) 200))
       resp)))
 
 (defun angelia-client-async (host method params success-fn &optional error-fn)
   "Asynchronously call METHOD on HOST with PARAMS.
-SUCCESS-FN is called with the result; optional ERROR-FN with the error plist."
-  (let ((conn (angelia-client-connection host)))
+SUCCESS-FN is called with the result; optional ERROR-FN with the error plist.
+The round-trip is timed via Tempus (the call returns immediately, so timing is
+logged from the wrapping callbacks rather than a body wrap)."
+  (let ((conn (angelia-client-connection host))
+        (t0 (current-time))
+        (label (format "client async %s on %s" method host)))
     (angelia-client--log "async-call %s on %s" method host)
-    (jsonrpc-async-request (angelia-client--conn-jsonrpc conn)
-                           method params
-                           :success-fn success-fn
-                           :error-fn error-fn)))
+    (jsonrpc-async-request
+     (angelia-client--conn-jsonrpc conn)
+     method params
+     :success-fn (lambda (result)
+                   (tempus-log-since label t0)
+                   (when success-fn (funcall success-fn result)))
+     :error-fn (lambda (err)
+                 (tempus-log-since label t0)
+                 (when error-fn (funcall error-fn err))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Interactive commands.

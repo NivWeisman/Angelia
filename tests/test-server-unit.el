@@ -542,4 +542,31 @@ contaminates the result."
     (should (= 1 (length frames)))
     (should (equal (gethash "kind" (gethash "params" (car frames))) "end"))))
 
+;; ---------------------------------------------------------------------------
+;; Latency simulation (ANGELIA_DELAY_MS).
+
+(ert-deftest test-server-parse-delay-ms ()
+  "ANGELIA_DELAY_MS is parsed into a non-negative ms count; junk -> 0."
+  (should (= 0   (angelia-server--parse-delay-ms nil)))
+  (should (= 0   (angelia-server--parse-delay-ms "")))
+  (should (= 0   (angelia-server--parse-delay-ms "0")))
+  (should (= 0   (angelia-server--parse-delay-ms "-5")))
+  (should (= 0   (angelia-server--parse-delay-ms "nope")))
+  (should (= 150 (angelia-server--parse-delay-ms "150"))))
+
+(ert-deftest test-server-simulate-delay-disabled ()
+  "With a 0 delay, `angelia-server--simulate-delay' returns effectively instantly."
+  (let* ((angelia-server--response-delay-ms 0)
+         (t0 (current-time)))
+    (angelia-server--simulate-delay)
+    (should (< (float-time (time-subtract (current-time) t0)) 0.05))))
+
+(ert-deftest test-server-simulate-delay-blocks ()
+  "A configured delay makes `angelia-server--simulate-delay' block at least that long."
+  (let* ((angelia-server--response-delay-ms 60)
+         (t0 (current-time)))
+    (angelia-server--simulate-delay)
+    ;; Generous lower bound (40ms) to tolerate timer granularity, no upper bound.
+    (should (>= (float-time (time-subtract (current-time) t0)) 0.04))))
+
 ;;; test-server-unit.el ends here
