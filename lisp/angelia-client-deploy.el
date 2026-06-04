@@ -193,31 +193,51 @@ captures stderr to a temp file so we can read it back as a string."
       (when (file-exists-p stderr-file) (delete-file stderr-file)))))
 
 (defun angelia-client--detect-shell-family (host)
-  "Return HOST's remote default-shell family: `csh' or `sh' (cached per HOST).
+  "Return HOST's remote default-shell family: `csh', `zsh', or `sh' (cached per HOST).
 Probes $SHELL with a bare command that needs no login environment, so it works
-even before PATH is set up.  Anything whose basename ends in `csh' (csh, tcsh)
-is treated as csh-family; everything else (bash, zsh, ksh, sh, ...) as sh."
+even before PATH is set up.  A basename ending in `csh' (csh, tcsh) is csh-family;
+one ending in `zsh' is zsh-family; everything else (bash, ksh, sh, ...) is sh."
   (or (gethash host angelia-client--remote-shell-family)
       (let* ((res (angelia-client--ssh-run-raw host "echo \"$SHELL\""))
              (out (string-trim (or (plist-get res :stdout) "")))
-             (family (if (string-match-p "csh\\'" out) 'csh 'sh)))
+             (family (cond ((string-match-p "csh\\'" out) 'csh)
+                           ((string-match-p "zsh\\'" out) 'zsh)
+                           (t 'sh))))
         (angelia-client--log "shell: host=%s $SHELL=%S family=%s" host out family)
         (puthash host family angelia-client--remote-shell-family)
         family)))
 
 (defun angelia-client--login-wrap (host bash-command)
   "Return the remote command string that runs BASH-COMMAND under HOST's login env.
-For csh-family default shells (csh/tcsh) the shell sources its login files --
-including /etc/csh.login, which on macOS runs path_helper to populate PATH --
-then execs bash to run BASH-COMMAND.  For sh-family shells we rely on bash's own
-`--login'.  BASH-COMMAND must contain no single quotes (csh single-quoting is
-literal and cannot embed them); all current callers satisfy this."
-  (if (eq (angelia-client--detect-shell-family host) 'csh)
-      (concat
-       "if ( -e /etc/csh.login ) source /etc/csh.login >& /dev/null; "
-       "if ( -e ~/.login ) source ~/.login >& /dev/null; "
-       "exec bash -c " (angelia-client--unix-quote bash-command))
-    (concat "bash --login -c " (angelia-client--unix-quote bash-command))))
+The remote default shell first loads the *login* environment its own way (so PATH
+matches an interactive login and finds emacs, etc.), then execs bash to run
+BASH-COMMAND.  Per family:
+
+  csh/tcsh : source /etc/csh.login + ~/.login, then exec bash.  /etc/csh.login is
+             where macOS path_helper populates PATH.
+  zsh      : source /etc/zprofile + ~/.zprofile, then exec bash.  Modern macOS
+             defaults to zsh, and /opt/homebrew/bin reaches PATH only via the
+             `brew shellenv' line in ~/.zprofile -- which `bash --login' never
+             sources.  /etc/zprofile is where macOS path_helper runs for zsh.
+  sh/bash  : rely on bash's own `--login' (sources /etc/profile + ~/.bash_profile).
+
+Every login-file `source' redirects its own stdout/stderr to /dev/null so a noisy
+profile can't corrupt the JSON-RPC stream on stdout.  BASH-COMMAND must contain no
+single quotes (csh single-quoting is literal and cannot embed them); all current
+callers satisfy this."
+  (pcase (angelia-client--detect-shell-family host)
+    ('csh
+     (concat
+      "if ( -e /etc/csh.login ) source /etc/csh.login >& /dev/null; "
+      "if ( -e ~/.login ) source ~/.login >& /dev/null; "
+      "exec bash -c " (angelia-client--unix-quote bash-command)))
+    ('zsh
+     (concat
+      "[ -f /etc/zprofile ] && source /etc/zprofile >/dev/null 2>&1; "
+      "[ -f ~/.zprofile ] && source ~/.zprofile >/dev/null 2>&1; "
+      "exec bash -c " (angelia-client--unix-quote bash-command)))
+    (_
+     (concat "bash --login -c " (angelia-client--unix-quote bash-command)))))
 
 (defun angelia-client--ssh-run (host args &optional stdin)
   "Run ARGS (joined into one command) on HOST under its remote LOGIN environment.
