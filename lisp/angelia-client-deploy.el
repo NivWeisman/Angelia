@@ -133,6 +133,22 @@ round-trip timings).  0 disables.  Takes effect on the next connect."
   :type 'integer
   :group 'angelia)
 
+(defcustom angelia-client-keepalive-interval 15
+  "Seconds for ssh `ServerAliveInterval' on every Angelia connection.
+ssh sends a keepalive probe after this much silence; combined with
+`angelia-client-keepalive-count' it tears a dead link down promptly (so the
+client notices and -- if enabled -- auto-reconnects) instead of hanging on a
+half-open TCP connection.  0 omits the option (use ssh's own default)."
+  :type 'integer
+  :group 'angelia)
+
+(defcustom angelia-client-keepalive-count 3
+  "ssh `ServerAliveCountMax' for Angelia connections.
+ssh drops the link after this many unanswered keepalive probes.  Ignored when
+`angelia-client-keepalive-interval' is 0."
+  :type 'integer
+  :group 'angelia)
+
 ;; Keep `tempus-debug' in sync for callers that `setq' the flag directly.
 (setq tempus-debug angelia-client-debug)
 

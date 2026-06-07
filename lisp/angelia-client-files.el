@@ -93,9 +93,14 @@ ours -- resolves it."
 ;; ---------------------------------------------------------------------------
 ;; Honest modtime + file-notify watches.
 
+(defvar angelia-client-files--watch-counter 0
+  "Monotonic id source for file-notify descriptors (stable across reconnects).")
+
 (defvar angelia-client-files--watches (make-hash-table :test #'equal)
-  "Map a file-notify descriptor (list \\='angelia-fnotify HOST SESSION) to a
-plist (:host :session).  Backs `file-notify-rm-watch' / `file-notify-valid-p',
+  "Map a file-notify descriptor (list \\='angelia-fnotify HOST ID) to a plist
+(:host :remote :flags :session).  The descriptor uses a stable ID -- NOT the
+session -- so it survives a reconnect: only :session is refreshed when the
+watch is re-opened.  Backs `file-notify-rm-watch' / `file-notify-valid-p',
 whose handler arg is the descriptor, not a path.")
 
 ;; Honest modtime.  The trick is `set-visited-file-modtime' with NO argument
@@ -137,12 +142,10 @@ nothing is recorded), nil when the remote file changed or vanished."
                         ('attribute-change "attribute-change")))
                     (if (listp flags) flags (list flags)))))
 
-(defun angelia-client-files--add-watch (host remote flags _callback)
-  "Start a remote file-notify watch on directory REMOTE on HOST.
-Returns a descriptor (list \\='angelia-fnotify HOST SESSION).  Events arrive as
-`fsevent' session events and are handed to `file-notify-callback', which looks
-the watch up by the (deterministic, `equal') descriptor and applies the
-single-file basename filter -- so CALLBACK is filenotify's concern, not ours."
+(defun angelia-client-files--open-watch-session (desc host remote flags)
+  "Open (or re-open) the `file/watch' session for DESC and record its session id.
+DESC is stable, so the same closure works across reconnects.  Events feed
+`file-notify-callback', which applies the single-file basename filter."
   (let* ((flag-strs (angelia-client-files--watch-flag-strings flags))
          (p (angelia-client-files--params "path" remote)))
     (puthash "flags" (vconcat flag-strs) p)
@@ -152,18 +155,42 @@ single-file basename filter -- so CALLBACK is filenotify's concern, not ours."
             (lambda (kind params)
               (when (equal kind "fsevent")
                 (file-notify-callback
-                 (list (list 'angelia-fnotify host (plist-get params :session))
+                 (list desc
                        (intern (or (plist-get params :action) "changed"))
                        (or (plist-get params :file) "")))))
+            ;; A terminal `end' means the server dropped the watch for good
+            ;; (e.g. the watched dir was deleted); tell filenotify it stopped.
+            ;; A mere connection drop sends no `end', so re-registration is not
+            ;; pre-empted.
             :on-end
-            (lambda (params)
-              (file-notify-callback
-               (list (list 'angelia-fnotify host (plist-get params :session))
-                     'stopped ""))))))
-      (let ((desc (list 'angelia-fnotify host session)))
-        (puthash desc (list :host host :session session)
-                 angelia-client-files--watches)
-        desc))))
+            (lambda (_params)
+              (file-notify-callback (list desc 'stopped ""))))))
+      (puthash desc (list :host host :remote remote :flags flags :session session)
+               angelia-client-files--watches)
+      session)))
+
+(defun angelia-client-files--add-watch (host remote flags _callback)
+  "Start a remote file-notify watch on directory REMOTE on HOST.
+Returns a stable descriptor (list \\='angelia-fnotify HOST ID).  CALLBACK is
+filenotify's concern: events are delivered through `file-notify-callback', which
+looks the watch up by the descriptor and applies the single-file filter."
+  (let ((desc (list 'angelia-fnotify host
+                    (cl-incf angelia-client-files--watch-counter))))
+    (angelia-client-files--open-watch-session desc host remote flags)
+    desc))
+
+(defun angelia-client-files--reregister-watches (host)
+  "Re-open every live watch for HOST after a (re)connect, keeping descriptors.
+Added to `angelia-client-after-connect-functions'; a no-op on the first connect."
+  (maphash
+   (lambda (desc info)
+     (when (equal (plist-get info :host) host)
+       (condition-case err
+           (angelia-client-files--open-watch-session
+            desc host (plist-get info :remote) (plist-get info :flags))
+         (error (angelia-client--log-error
+                 (format "reregister watch %S" desc) err)))))
+   angelia-client-files--watches))
 
 (defun angelia-client-files--rm-watch (descriptor)
   "Tear down the remote watch identified by DESCRIPTOR (the `file/unwatch' RPC)."
@@ -183,6 +210,11 @@ single-file basename filter -- so CALLBACK is filenotify's concern, not ours."
            (gethash (plist-get info :session)
                     (angelia-client--conn-sessions conn))
            t))))
+
+;; Re-open live watches whenever a connection (re)appears, so a dropped link
+;; restores them transparently once it comes back (Step 3).
+(add-hook 'angelia-client-after-connect-functions
+          #'angelia-client-files--reregister-watches)
 
 (defun angelia-client-files--insert-file-contents (host remote args)
   "Read REMOTE on HOST via chunked `file/read' and insert the bytes here.

@@ -42,6 +42,40 @@ The notification dispatcher in `angelia-client-connect' uses it to route
 (defvar angelia-client--connections (make-hash-table :test #'equal)
   "Map HOST (string) -> live `angelia-client--conn'.")
 
+(defcustom angelia-client-auto-reconnect t
+  "When non-nil, transparently re-establish a connection that dropped unexpectedly.
+An explicit `angelia-client-disconnect' is never auto-reconnected.  Two paths use
+this: the next `angelia-client-call' reconnects on demand, and the shutdown
+sentinel schedules a background reconnect with backoff."
+  :type 'boolean
+  :group 'angelia)
+
+(defcustom angelia-client-reconnect-max-attempts 5
+  "Maximum background reconnect attempts after an unexpected drop (0 disables).
+Each attempt waits `angelia-client-reconnect-base-delay' doubled per try."
+  :type 'integer
+  :group 'angelia)
+
+(defcustom angelia-client-reconnect-base-delay 1.0
+  "Seconds before the first background reconnect attempt; doubles each retry."
+  :type 'number
+  :group 'angelia)
+
+(defvar angelia-client-after-connect-functions nil
+  "Abnormal hook run with one argument HOST after a successful (re)connect.
+`angelia-client-files' uses it to re-register live file-notify watches once a
+dropped connection comes back.  Runs on the initial connect too (a no-op when
+the host has no prior state).")
+
+(defvar angelia-client--disconnecting (make-hash-table :test #'equal)
+  "Set of hosts (string -> t) currently being torn down on purpose.
+The shutdown sentinel consults it so an explicit `angelia-client-disconnect'
+is not mistaken for an unexpected drop and auto-reconnected.")
+
+(defvar angelia-client--reconnecting (make-hash-table :test #'equal)
+  "Set of hosts (string -> t) with a background reconnect already in flight,
+so overlapping shutdown events don't stack multiple reconnect loops.")
+
 ;; ---------------------------------------------------------------------------
 ;; Helpers.
 
@@ -68,8 +102,14 @@ default login shell (csh/tcsh included); see `angelia-client--login-wrap'."
          (script    (concat "exec 3<&0; f=$(mktemp -u) && mkfifo -m 0600 \"$f\" && "
                             "{ cat <&3 > \"$f\" 3<&- & } && exec 3<&- && "
                             emacs-cmd "; rm -f \"$f\"")))
-    (list angelia-client-ssh-program host
-          (angelia-client--login-wrap host script))))
+    (append
+     (list angelia-client-ssh-program)
+     ;; Keepalive so a dropped link is detected promptly instead of hanging on
+     ;; a half-open socket; this is what lets auto-reconnect kick in.
+     (when (> angelia-client-keepalive-interval 0)
+       (list "-o" (format "ServerAliveInterval=%d" angelia-client-keepalive-interval)
+             "-o" (format "ServerAliveCountMax=%d" angelia-client-keepalive-count)))
+     (list host (angelia-client--login-wrap host script)))))
 
 (defun angelia-client--stderr-buffer-name (host)
   "Return the buffer name that captures the remote process's stderr for HOST."
@@ -98,15 +138,54 @@ default login shell (csh/tcsh included); see `angelia-client--login-wrap'."
         (completing-read (or prompt "Host: ") hosts nil nil nil nil (car hosts))
       (read-string (or prompt "Host: ")))))
 
-(defun angelia-client--on-shutdown (host)
-  "Run when the jsonrpc connection for HOST shuts down.  Drops it from the map."
-  (angelia-client--log "shutdown callback fired for host=%s" host)
-  (when (fboundp 'angelia-client-lsp--cleanup-host)
-    (angelia-client-lsp--cleanup-host host))
-  (when-let ((conn (gethash host angelia-client--connections)))
-    (when (process-live-p (angelia-client--conn-process conn))
-      (delete-process (angelia-client--conn-process conn))))
-  (remhash host angelia-client--connections))
+(defun angelia-client--on-shutdown (host &optional proc)
+  "Run when the jsonrpc connection for HOST shuts down.  Drops it from the map.
+PROC, when given, is the process this shutdown belongs to; if the host is now
+registered under a DIFFERENT process (a newer connection already took its
+place), this is a stale shutdown and we do nothing -- otherwise it would tear
+down the live replacement.  If the drop was unexpected (not an explicit
+`angelia-client-disconnect') and `angelia-client-auto-reconnect' is on, schedule
+a background reconnect."
+  (let ((conn (gethash host angelia-client--connections)))
+    (if (and proc conn (not (eq (angelia-client--conn-process conn) proc)))
+        (angelia-client--log "stale shutdown for host=%s (superseded); ignoring" host)
+      (angelia-client--log "shutdown callback fired for host=%s" host)
+      (when (fboundp 'angelia-client-lsp--cleanup-host)
+        (angelia-client-lsp--cleanup-host host))
+      (when (and conn (process-live-p (angelia-client--conn-process conn)))
+        (delete-process (angelia-client--conn-process conn)))
+      (remhash host angelia-client--connections)
+      (when (and angelia-client-auto-reconnect
+                 (> angelia-client-reconnect-max-attempts 0)
+                 (not (gethash host angelia-client--disconnecting))
+                 (not (gethash host angelia-client--reconnecting)))
+        (puthash host t angelia-client--reconnecting)
+        (angelia-client--log "scheduling auto-reconnect for host=%s" host)
+        (run-at-time angelia-client-reconnect-base-delay nil
+                     #'angelia-client--attempt-reconnect host 1)))))
+
+(defun angelia-client--attempt-reconnect (host attempt)
+  "Try to reconnect to HOST (ATTEMPT-th try); retry with backoff or give up.
+On success runs `angelia-client-after-connect-functions' (already triggered by
+`angelia-client-connect') and clears the in-flight flag."
+  ;; A live connection may have been re-established meanwhile (e.g. a call-time
+  ;; reconnect); if so we are done.
+  (if (angelia-client--existing-live-connection host)
+      (remhash host angelia-client--reconnecting)
+    (condition-case err
+        (progn
+          (angelia-client--log "auto-reconnect attempt %d for host=%s" attempt host)
+          (angelia-client-connect host)
+          (remhash host angelia-client--reconnecting)
+          (angelia-client--log "auto-reconnect ok for host=%s" host))
+      (error
+       (angelia-client--log-error
+        (format "auto-reconnect attempt %d host=%s" attempt host) err)
+       (if (< attempt angelia-client-reconnect-max-attempts)
+           (run-at-time (* angelia-client-reconnect-base-delay (expt 2 attempt)) nil
+                        #'angelia-client--attempt-reconnect host (1+ attempt))
+         (remhash host angelia-client--reconnecting)
+         (angelia-client--log "auto-reconnect gave up for host=%s" host))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Connect / disconnect.
@@ -154,7 +233,7 @@ on transport / handshake failure (cleaning up the dead process first)."
                                       (jsonrpc-error-message
                                        . ,(format "Client does not handle %s" method)))))
                           :on-shutdown
-                          (lambda (_c) (angelia-client--on-shutdown host))))
+                          (lambda (_c) (angelia-client--on-shutdown host proc))))
               (setq conn (angelia-client--conn-create
                           :host host
                           :process proc
@@ -175,6 +254,9 @@ on transport / handshake failure (cleaning up the dead process first)."
                                 :expected angelia-client--server-sha1
                                 :got remote-sha))))
               (angelia-client--log "connect: ok host=%s" host)
+              ;; Let dependents (e.g. file-notify watch re-registration) react to
+              ;; a fresh connection.  Errors in a hook fn must not fail connect.
+              (run-hook-with-args 'angelia-client-after-connect-functions host)
               conn)
           (error
            (angelia-client--log-error "connect" err)
@@ -183,16 +265,22 @@ on transport / handshake failure (cleaning up the dead process first)."
            (signal (car err) (cdr err)))))))
 
 (defun angelia-client-disconnect (host)
-  "Tear down the live connection to HOST, if any."
+  "Tear down the live connection to HOST, if any.
+Marks HOST as intentionally disconnecting so the shutdown sentinel does not
+auto-reconnect it."
   (interactive (list (angelia-client--read-host "Disconnect host: ")))
   (when-let ((conn (gethash host angelia-client--connections)))
     (angelia-client--log "disconnect: host=%s" host)
-    (condition-case err
-        (jsonrpc-shutdown (angelia-client--conn-jsonrpc conn))
-      (error (angelia-client--log-error "disconnect/jsonrpc-shutdown" err)))
-    (when (process-live-p (angelia-client--conn-process conn))
-      (delete-process (angelia-client--conn-process conn)))
-    (remhash host angelia-client--connections)))
+    (puthash host t angelia-client--disconnecting)
+    (unwind-protect
+        (progn
+          (condition-case err
+              (jsonrpc-shutdown (angelia-client--conn-jsonrpc conn))
+            (error (angelia-client--log-error "disconnect/jsonrpc-shutdown" err)))
+          (when (process-live-p (angelia-client--conn-process conn))
+            (delete-process (angelia-client--conn-process conn)))
+          (remhash host angelia-client--connections))
+      (remhash host angelia-client--disconnecting))))
 
 (defun angelia-client-reconnect (host)
   "Disconnect from HOST (if connected) then establish a fresh connection.
@@ -312,9 +400,8 @@ if the server's response lacks a session id."
 ;; ---------------------------------------------------------------------------
 ;; RPC surface.
 
-(defun angelia-client-call (host method &optional params timeout)
-  "Synchronously call METHOD on HOST with PARAMS.  Returns the result.
-TIMEOUT is seconds (default 30)."
+(defun angelia-client--call-once (host method params timeout)
+  "Issue one METHOD request to HOST with PARAMS; return the result."
   (let* ((conn (angelia-client-connection host))
          (id-buf (angelia-client--truncate (format "%S" params) 200)))
     (angelia-client--log "call %s on %s params=%s" method host id-buf)
@@ -326,6 +413,26 @@ TIMEOUT is seconds (default 30)."
                            method host
                            (angelia-client--truncate (format "%S" resp) 200))
       resp)))
+
+(defun angelia-client-call (host method &optional params timeout)
+  "Synchronously call METHOD on HOST with PARAMS.  Returns the result.
+TIMEOUT is seconds (default 30).  If the connection has dropped and
+`angelia-client-auto-reconnect' is on, reconnect once and retry transparently
+-- but only when the connection is actually dead, so a genuine method error
+\(file not found, etc.) is re-signalled untouched."
+  (condition-case err
+      (angelia-client--call-once host method params timeout)
+    ((angelia-client-not-connected jsonrpc-error error)
+     (if (and angelia-client-auto-reconnect
+              (not (angelia-client--existing-live-connection host)))
+         (progn
+           (angelia-client--log
+            "call %s on %s: connection down (%s), reconnecting"
+            method host (error-message-string err))
+           (ignore-errors (angelia-client-disconnect host))
+           (angelia-client-connect host)
+           (angelia-client--call-once host method params timeout))
+       (signal (car err) (cdr err))))))
 
 (defun angelia-client-async (host method params success-fn &optional error-fn)
   "Asynchronously call METHOD on HOST with PARAMS.

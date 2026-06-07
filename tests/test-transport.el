@@ -8,8 +8,10 @@
 (require 'ert)
 (require 'cl-lib)
 (require 'subr-x)
+(require 'filenotify)
 (require 'test-helpers)
 (require 'angelia-client)
+(require 'angelia-client-files)
 
 (defconst angelia-tests--target-host "localhost"
   "Single-VM test target.  Single point to retarget all transport tests.")
@@ -218,5 +220,84 @@ sees only its own session's events in order."
           (accept-process-output nil 0.05)))
       (should ended)
       (should (null events)))))
+
+;; ---------------------------------------------------------------------------
+;; Auto-reconnect (Step 3).  `angelia-client-reconnect-max-attempts' is set to 0
+;; in these tests to disable the background-timer path and isolate the
+;; deterministic call-time reconnect.
+
+(ert-deftest test-auto-reconnect-on-call ()
+  "After the ssh process is killed, the next `angelia-client-call' transparently
+reconnects and succeeds on a genuinely new process."
+  (angelia-tests--transport-setup)
+  (let ((angelia-client-auto-reconnect t)
+        (angelia-client-reconnect-max-attempts 0))
+    (unwind-protect
+        (let* ((conn (angelia-client-connect angelia-tests--target-host))
+               (first-pid (process-id (angelia-client--conn-process conn))))
+          (should (process-live-p (angelia-client--conn-process conn)))
+          (delete-process (angelia-client--conn-process conn))
+          (should-not (process-live-p (angelia-client--conn-process conn)))
+          ;; The next call must succeed by reconnecting under the hood.
+          (should (eq (plist-get (angelia-client-call
+                                  angelia-tests--target-host 'server/ping nil)
+                                 :pong)
+                      t))
+          (let ((new (angelia-client--existing-live-connection
+                      angelia-tests--target-host)))
+            (should new)
+            (should-not (equal first-pid
+                               (process-id (angelia-client--conn-process new))))))
+      (when (gethash angelia-tests--target-host angelia-client--connections)
+        (angelia-client-disconnect angelia-tests--target-host)))))
+
+(ert-deftest test-explicit-disconnect-no-auto-reconnect ()
+  "An explicit `angelia-client-disconnect' is never auto-reconnected."
+  (angelia-tests--transport-setup)
+  (let ((angelia-client-auto-reconnect t)
+        (angelia-client-reconnect-max-attempts 5)
+        (angelia-client-reconnect-base-delay 0.1))
+    (angelia-client-connect angelia-tests--target-host)
+    (angelia-client-disconnect angelia-tests--target-host)
+    ;; Pump well past the first backoff window; the host must stay down.
+    (with-timeout (1 nil)
+      (while t (accept-process-output nil 0.1)))
+    (should-not (gethash angelia-tests--target-host
+                         angelia-client--connections))))
+
+(ert-deftest test-watch-survives-reconnect ()
+  "A file-notify watch is re-registered (same descriptor, fresh session) after a
+dropped connection is restored."
+  (angelia-tests--transport-setup)
+  (let ((angelia-client-auto-reconnect t)
+        (angelia-client-reconnect-max-attempts 0)
+        (dir (file-name-as-directory (make-temp-file "angelia-recon-watch-" t))))
+    (unwind-protect
+        (progn
+          (angelia-client-connect angelia-tests--target-host)
+          (let* ((url (concat "/@angelia:" angelia-tests--target-host ":" dir))
+                 (desc (file-notify-add-watch url '(change) #'ignore))
+                 (old-session (plist-get
+                               (gethash desc angelia-client-files--watches)
+                               :session)))
+            (should (file-notify-valid-p desc))
+            (should old-session)
+            ;; Kill the link.
+            (delete-process
+             (angelia-client--conn-process
+              (angelia-client--existing-live-connection
+               angelia-tests--target-host)))
+            ;; A call reconnects; the after-connect hook re-registers watches.
+            (angelia-client-call angelia-tests--target-host 'server/ping nil)
+            (should (file-notify-valid-p desc))
+            (let ((new-session (plist-get
+                                (gethash desc angelia-client-files--watches)
+                                :session)))
+              (should new-session)
+              (should-not (equal old-session new-session)))
+            (file-notify-rm-watch desc)))
+      (when (gethash angelia-tests--target-host angelia-client--connections)
+        (angelia-client-disconnect angelia-tests--target-host))
+      (when (file-directory-p dir) (delete-directory dir t)))))
 
 ;;; test-transport.el ends here

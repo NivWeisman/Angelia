@@ -40,6 +40,17 @@ overwriting it. `file-notify-add-watch` is implemented over a remote
 events), so `auto-revert-mode` and log-tailing work on `/@angelia:` buffers
 wherever the remote host delivers file-notification events.
 
+## Resilience
+
+Connections carry ssh keepalive (`ServerAliveInterval`/`CountMax`) so a dead
+link is noticed instead of hanging on a half-open socket. When a connection
+drops unexpectedly, Angelia reconnects transparently — the next request
+re-establishes the link, and a background retry with exponential backoff runs in
+parallel — then re-registers any live `file-notify` watches against the fresh
+connection. An explicit `M-x angelia-client-disconnect` is never auto-reconnected.
+Tunables: `angelia-client-auto-reconnect`, `angelia-client-keepalive-interval`,
+`angelia-client-reconnect-max-attempts`.
+
 ## Interactive commands
 
 | Command | Purpose |
