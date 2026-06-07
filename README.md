@@ -51,6 +51,26 @@ connection. An explicit `M-x angelia-client-disconnect` is never auto-reconnecte
 Tunables: `angelia-client-auto-reconnect`, `angelia-client-keepalive-interval`,
 `angelia-client-reconnect-max-attempts`.
 
+## Server-side config
+
+The server runs `emacs --batch -Q`, so it never inherits the remote host's
+`init.el` — fast and deterministic. To extend it, point
+`angelia-server-config-file` at a **dedicated** local elisp file (not your
+`init.el`); it is deployed to the server and loaded there on connect (and
+re-applied after a reconnect). Use it to register custom RPC methods
+(`angelia-server-register-method`), set up projects / `process-environment`, and
+declare this host's LSP servers (`angelia-server-register-lsp`, which the client
+reads back to configure eglot — the LSP processes still launch client-side).
+
+```elisp
+(require 'angelia-client-config)
+(setq angelia-server-config-file "~/.config/angelia/server-config.el")
+```
+
+The config must be batch-safe and must **not** write to stdout (that stream
+carries JSON-RPC; the server guards the load, but a config that hangs or errors
+is on you). Load on demand with `M-x angelia-client-load-server-config`.
+
 ## Edit locking
 
 `lock-file` / `unlock-file` / `file-locked-p` are backed by Emacs-style `.#NAME`
@@ -72,6 +92,7 @@ Angelia path; capped by `angelia-client-files-search-max`.
 |---|---|
 | `M-x angelia-client-connect`         | Connect to a host explicitly (otherwise opening a remote file connects on demand). |
 | `M-x angelia-grep`                   | Stream `rg`/`grep` results from the remote host into a `grep-mode` buffer. |
+| `M-x angelia-client-load-server-config` | Deploy and load `angelia-server-config-file` into the remote server. |
 | `M-x angelia-client-disconnect`      | Tear down a connection. |
 | `M-x angelia-client-send-ping`       | Round-trip ping; reports milliseconds. |
 | `M-x angelia-client-server-info`     | Show remote Emacs version, server hash, PID, uptime. |

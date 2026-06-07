@@ -12,6 +12,7 @@ A split-client Emacs Remote-SSH package, like VS Code's Remote-SSH. Local Emacs 
 - `lisp/angelia-client.el` — local entry point. SSH process + jsonrpc connection lifecycle.
 - `lisp/angelia-client-deploy.el` — version check, deploy, sha1 handshake.
 - `lisp/angelia-client-files.el` — `file-name-handler-alist` entry for `/@angelia:HOST:/path`.
+- `lisp/angelia-client-config.el` — optional: deploy + load a dedicated server config file (`angelia-server-config-file`) into the `--batch -Q` backend for custom methods / projects / LSP declarations. Re-applied on reconnect via `angelia-client-after-connect-functions`.
 - `lisp/tempus.el` — standalone, zero-dependency timing utility (`tempus-measure`). Canonical source; the server **inlines** an equivalent copy in `angelia-server.el` (single-file deploy, see Tempus rule below).
 - `tests/test-server-unit.el` (Layer 0) — no SSH.
 - `tests/test-transport.el` (Layer 1) — SSH localhost.

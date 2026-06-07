@@ -80,6 +80,27 @@ server would not be on PATH."
         (should (string-match-p "exec bash -c" remote-arg))
         (should-not (string-match-p "bash --login" remote-arg))))))
 
+(ert-deftest test-lsp-configure-from-server ()
+  "`angelia-client-lsp-configure-from-server' maps the server's declared programs
+\(a keyword plist) into per-host `angelia-client-lsp-server-programs' entries."
+  (let ((angelia-client-lsp-server-programs nil)
+        (configured nil))
+    (cl-letf (((symbol-function 'angelia-client-call)
+               (lambda (_host method &rest _)
+                 (when (eq method 'server/lsp-programs)
+                   '(:programs (:python-mode "pylsp" :rust-mode "rust-analyzer")))))
+              ((symbol-function 'angelia-client-lsp-configure)
+               (lambda () (setq configured t))))
+      (let ((n (angelia-client-lsp-configure-from-server "myhost")))
+        (should (= n 2))
+        (should configured)
+        (should (equal "pylsp"
+                       (alist-get '("myhost" python-mode)
+                                  angelia-client-lsp-server-programs nil nil #'equal)))
+        (should (equal "rust-analyzer"
+                       (alist-get '("myhost" rust-mode)
+                                  angelia-client-lsp-server-programs nil nil #'equal)))))))
+
 ;; ---------------------------------------------------------------------------
 ;; Layer 2 — process lifecycle (SSH localhost).
 

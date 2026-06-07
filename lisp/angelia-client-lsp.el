@@ -214,5 +214,31 @@ Safe to call multiple times; defers registration until the relevant package load
     (with-eval-after-load 'lsp-mode
       (angelia-client-lsp-lsp-mode-setup host mode cmd))))
 
+;;;###autoload
+(defun angelia-client-lsp-configure-from-server (host)
+  "Configure LSP for HOST from the programs its server config declared.
+Queries `server/lsp-programs' (populated by `angelia-server-register-lsp' in the
+injected config) and registers each MODE -> COMMAND for this host via the same
+machinery as `angelia-client-lsp-server-programs'.  The LSP processes still
+launch client-side over ssh; this only carries the per-host *policy*."
+  (interactive (list (angelia-client--read-host "Configure LSP from host: ")))
+  (let* ((resp (angelia-client-call host 'server/lsp-programs nil))
+         (programs (plist-get resp :programs))
+         (added 0))
+    ;; jsonrpc decodes the JSON object as a plist with keyword keys, e.g.
+    ;; (:python-mode "pylsp" :rust-mode "rust-analyzer").
+    (while programs
+      (let* ((mode (intern (substring (symbol-name (car programs)) 1)))
+             (cmd (cadr programs)))
+        (when (stringp cmd)
+          (setf (alist-get (list host mode) angelia-client-lsp-server-programs
+                           nil nil #'equal)
+                cmd)
+          (cl-incf added))
+        (setq programs (cddr programs))))
+    (when (> added 0) (angelia-client-lsp-configure))
+    (angelia-client--log "lsp: configured %d program(s) from %s" added host)
+    added))
+
 (provide 'angelia-client-lsp)
 ;;; angelia-client-lsp.el ends here

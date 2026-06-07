@@ -473,9 +473,83 @@ registered a callback for yet, and drop them."
        (angelia-server--end-session conn session)))
     result))
 
+;; ---------------------------------------------------------------------------
+;; Server-side config injection.
+;;
+;; The client may push a dedicated elisp config file (NOT the user's init.el)
+;; that runs here, in the `--batch -Q' backend.  It is a place to register
+;; custom RPC methods (`angelia-server-register-method'), set up projects/env,
+;; and declare which LSP servers this host offers (`angelia-server-register-lsp',
+;; which the client reads back to configure eglot -- the LSP processes still
+;; launch client-side).  The server is fresh on every (re)connect, so the client
+;; re-applies the config each time.
+
+(defvar angelia-server-lsp-programs nil
+  "Alist (MODE-STRING . COMMAND-STRING) of LSP servers this host offers.
+Populated by the loaded config via `angelia-server-register-lsp'; the client
+reads it via `server/lsp-programs' to configure eglot/lsp-mode for this host.")
+
+(defun angelia-server-register-lsp (mode command)
+  "Declare that MODE (a symbol or string) uses the LSP COMMAND on this host.
+Called from the injected config file; read back by the client."
+  (let ((m (if (symbolp mode) (symbol-name mode) mode)))
+    (setf (alist-get m angelia-server-lsp-programs nil nil #'equal) command)))
+
+(defun angelia-server--lsp-programs-hash ()
+  "Return `angelia-server-lsp-programs' as a hash-table for serialization."
+  (let ((h (make-hash-table :test #'equal)))
+    (dolist (pair angelia-server-lsp-programs) (puthash (car pair) (cdr pair) h))
+    h))
+
+(defun angelia-server--builtin-load-config (_conn params)
+  "Load the elisp config in PARAMS->content (base64) into this server.
+Stdout is guarded for the whole load: any `princ'/`print' the config emits is
+captured and relogged to stderr, NEVER written to the JSON-RPC stream (hard rule
+1).  Returns {ok, error, methods, lsp}: the registered method names and declared
+LSP programs after the load, so the client can confirm what was applied."
+  (let* ((b64 (and (hash-table-p params) (gethash "content" params)))
+         (result (make-hash-table :test #'equal)))
+    (unless (stringp b64) (error "server/load-config: missing string `content'"))
+    (let ((code (decode-coding-string (base64-decode-string b64) 'utf-8 t))
+          (tmp (make-temp-file "angelia-config-" nil ".el")))
+      (unwind-protect
+          (condition-case err
+              (progn
+                (let ((coding-system-for-write 'utf-8))
+                  (with-temp-file tmp (insert code)))
+                ;; Capture anything the config writes to `standard-output' so it
+                ;; cannot corrupt stdout; relog it to stderr for visibility.
+                (with-temp-buffer
+                  (let ((standard-output (current-buffer)))
+                    (load tmp nil t t))   ; NOERROR=nil NOMESSAGE=t NOSUFFIX=t
+                  (when (> (buffer-size) 0)
+                    (angelia-server--log
+                     "load-config stdout (suppressed): %s"
+                     (angelia-server--truncate (buffer-string) 500))))
+                (puthash "ok" t result)
+                (puthash "methods"
+                         (vconcat (sort (hash-table-keys angelia-server--methods)
+                                        #'string<))
+                         result)
+                (puthash "lsp" (angelia-server--lsp-programs-hash) result))
+            (error
+             (angelia-server--log-error err)
+             (puthash "ok" :false result)
+             (puthash "error" (error-message-string err) result)))
+        (ignore-errors (delete-file tmp))))
+    result))
+
+(defun angelia-server--builtin-lsp-programs (_conn _params)
+  "Return {programs: {MODE: COMMAND, ...}} declared by the loaded config."
+  (let ((result (make-hash-table :test #'equal)))
+    (puthash "programs" (angelia-server--lsp-programs-hash) result)
+    result))
+
 (angelia-server-register-method "server/ping"    #'angelia-server--builtin-ping)
 (angelia-server-register-method "server/version" #'angelia-server--builtin-version)
 (angelia-server-register-method "server/info"    #'angelia-server--builtin-info)
+(angelia-server-register-method "server/load-config" #'angelia-server--builtin-load-config)
+(angelia-server-register-method "server/lsp-programs" #'angelia-server--builtin-lsp-programs)
 (angelia-server-register-method "session/close"  #'angelia-server--builtin-session-close)
 (angelia-server-register-method "session/echo"   #'angelia-server--builtin-session-echo)
 
