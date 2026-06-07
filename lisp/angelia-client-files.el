@@ -16,6 +16,9 @@
 (require 'subr-x)
 (require 'angelia-client)
 (require 'angelia-client-proc)
+;; `filenotify' gives us `file-notify-callback', the entry point that feeds
+;; remote change events back into Emacs's watch machinery (auto-revert, etc.).
+(require 'filenotify)
 
 ;; ---------------------------------------------------------------------------
 ;; Path syntax.
@@ -87,6 +90,100 @@ ours -- resolves it."
 (defconst angelia-client-files--io-timeout 120
   "Seconds before a streamed read/write gives up and signals an error.")
 
+;; ---------------------------------------------------------------------------
+;; Honest modtime + file-notify watches.
+
+(defvar angelia-client-files--watches (make-hash-table :test #'equal)
+  "Map a file-notify descriptor (list \\='angelia-fnotify HOST SESSION) to a
+plist (:host :session).  Backs `file-notify-rm-watch' / `file-notify-valid-p',
+whose handler arg is the descriptor, not a path.")
+
+;; Honest modtime.  The trick is `set-visited-file-modtime' with NO argument
+;; records 0 (the \"unknown\" sentinel) for a remote path -- it cannot stat the
+;; literal /@angelia:... string -- and Emacs then treats the buffer as always
+;; up-to-date.  Recording the *real* remote mtime explicitly (via the existing
+;; file/attributes RPC) makes the native `verify-visited-file-modtime' compare
+;; correctly, so an external edit is caught instead of silently clobbered.
+
+(defun angelia-client-files--record-visited-modtime (host remote)
+  "Record REMOTE's real mtime on HOST as this buffer's visited modtime.
+Falls back to `current-time' if the attributes can't be fetched, so the buffer
+is never left with the always-stale 0 sentinel."
+  (let ((attrs (angelia-client-files--file-attributes host remote)))
+    (set-visited-file-modtime (or (and attrs (nth 5 attrs)) (current-time)))))
+
+(defun angelia-client-files--verify-visited-modtime (buffer)
+  "Belt-and-suspenders `verify-visited-file-modtime' for Angelia buffers.
+The native primitive already works once we record an explicit modtime, but for
+any code path that does route this op through the handler, compare the recorded
+visited modtime against the file's current remote mtime: t when they match (or
+nothing is recorded), nil when the remote file changed or vanished."
+  (with-current-buffer (or (and (bufferp buffer) buffer) (current-buffer))
+    (let ((stored (visited-file-modtime))
+          (parsed (and (stringp buffer-file-name)
+                       (angelia-client-files--parse buffer-file-name))))
+      (cond
+       ((or (null parsed) (not (consp stored)) (time-equal-p stored 0)) t)
+       (t (let ((attrs (angelia-client-files--file-attributes
+                        (car parsed) (cdr parsed))))
+            (cond ((null attrs) nil)            ; file vanished -> changed
+                  (t (time-equal-p stored (nth 5 attrs))))))))))
+
+(defun angelia-client-files--watch-flag-strings (flags)
+  "Map Emacs file-notify FLAGS to the wire strings `file/watch' expects."
+  (delq nil (mapcar (lambda (f)
+                      (pcase f
+                        ('change "change")
+                        ('attribute-change "attribute-change")))
+                    (if (listp flags) flags (list flags)))))
+
+(defun angelia-client-files--add-watch (host remote flags _callback)
+  "Start a remote file-notify watch on directory REMOTE on HOST.
+Returns a descriptor (list \\='angelia-fnotify HOST SESSION).  Events arrive as
+`fsevent' session events and are handed to `file-notify-callback', which looks
+the watch up by the (deterministic, `equal') descriptor and applies the
+single-file basename filter -- so CALLBACK is filenotify's concern, not ours."
+  (let* ((flag-strs (angelia-client-files--watch-flag-strings flags))
+         (p (angelia-client-files--params "path" remote)))
+    (puthash "flags" (vconcat flag-strs) p)
+    (let ((session
+           (angelia-client-open-session
+            host 'file/watch p
+            (lambda (kind params)
+              (when (equal kind "fsevent")
+                (file-notify-callback
+                 (list (list 'angelia-fnotify host (plist-get params :session))
+                       (intern (or (plist-get params :action) "changed"))
+                       (or (plist-get params :file) "")))))
+            :on-end
+            (lambda (params)
+              (file-notify-callback
+               (list (list 'angelia-fnotify host (plist-get params :session))
+                     'stopped ""))))))
+      (let ((desc (list 'angelia-fnotify host session)))
+        (puthash desc (list :host host :session session)
+                 angelia-client-files--watches)
+        desc))))
+
+(defun angelia-client-files--rm-watch (descriptor)
+  "Tear down the remote watch identified by DESCRIPTOR (the `file/unwatch' RPC)."
+  (when-let ((info (gethash descriptor angelia-client-files--watches)))
+    (remhash descriptor angelia-client-files--watches)
+    (ignore-errors
+      (angelia-client-call
+       (plist-get info :host) 'file/unwatch
+       (angelia-client-files--params "session" (plist-get info :session)))))
+  nil)
+
+(defun angelia-client-files--valid-watch-p (descriptor)
+  "Return non-nil when DESCRIPTOR's remote watch session is still live."
+  (when-let ((info (gethash descriptor angelia-client-files--watches)))
+    (let ((conn (gethash (plist-get info :host) angelia-client--connections)))
+      (and conn
+           (gethash (plist-get info :session)
+                    (angelia-client--conn-sessions conn))
+           t))))
+
 (defun angelia-client-files--insert-file-contents (host remote args)
   "Read REMOTE on HOST via chunked `file/read' and insert the bytes here.
 ARGS is the full argument list to `insert-file-contents'.  Chunks arrive
@@ -131,9 +228,10 @@ callback then insert the joined bytes (decoded as UTF-8) at point."
         ;; Record the remote file's mtime as the buffer's last-visited modtime.
         ;; With no arg, `set-visited-file-modtime' looks up `file-attributes'
         ;; on the visited path -- which routes through our handler -- so the
-        ;; recorded value matches what `verify-visited-file-modtime' reads
-        ;; later, silencing `save-buffer''s "changed since visited" prompt.
-        (set-visited-file-modtime)
+        ;; Record the *real* remote mtime (not the no-arg 0 sentinel) so a
+        ;; later external edit makes `verify-visited-file-modtime' return nil
+        ;; and the user is warned instead of silently clobbering the change.
+        (angelia-client-files--record-visited-modtime host remote)
         ;; Disable on-save backups + lockfiles + autosave for this buffer.
         ;; Each of those tries to operate on the local fs path, which doesn't
         ;; exist; the result is `save-buffer' failing with `file-missing'.
@@ -201,7 +299,10 @@ its in-progress tmp file."
     (when (or (eq visit t) (stringp visit))
       (setq buffer-file-name (if (stringp visit) visit filename))
       (set-buffer-modified-p nil)
-      (set-visited-file-modtime))
+      ;; Record the just-written file's real mtime so the next
+      ;; `verify-visited-file-modtime' does not mistake our own save for an
+      ;; external edit (a no-arg `set-visited-file-modtime' would record 0).
+      (angelia-client-files--record-visited-modtime host remote))
     (unless (or (null visit) (eq visit t) (stringp visit))
       (message "Wrote %s" filename))
     nil))
@@ -504,10 +605,19 @@ Unrecognized operations fall through to the default handler chain."
   (cond
    ((eq operation 'verify-visited-file-modtime)
     ;; Without an interceptor, Emacs would `stat' the literal `/@angelia:...'
-    ;; string on the local fs and conclude the buffer is out-of-date.  We
-    ;; trust that our recorded modtime matches what the remote sees.  TODO:
-    ;; refine once file/read returns mtime and we record it precisely.
-    t)
+    ;; string on the local fs and conclude the buffer is out-of-date.  Compare
+    ;; the recorded remote mtime against the file's current remote mtime so an
+    ;; external edit is actually detected (not silently clobbered).
+    (angelia-client-files--verify-visited-modtime (car args)))
+   ;; `file-notify-rm-watch' / `file-notify-valid-p' are dispatched with the
+   ;; opaque DESCRIPTOR (not a path), so they must be handled before the
+   ;; path-extraction below -- which would otherwise find no angelia string and
+   ;; delegate.  `file-notify-add-watch' carries the directory path and is
+   ;; handled in the main cond.
+   ((eq operation 'file-notify-rm-watch)
+    (angelia-client-files--rm-watch (nth 0 args)))
+   ((eq operation 'file-notify-valid-p)
+    (angelia-client-files--valid-watch-p (nth 0 args)))
    (t
   (let* ((first-path (cl-find-if (lambda (a)
                                    (and (stringp a)
@@ -636,6 +746,10 @@ Unrecognized operations fall through to the default handler chain."
         nil))
      ((eq operation 'insert-directory)
       (angelia-client-files--insert-directory host remote args))
+     ((eq operation 'file-notify-add-watch)
+      ;; ARGS is (DIR FLAGS CALLBACK): filenotify already reduced a file watch
+      ;; to its parent directory, which is what `remote' is here.
+      (angelia-client-files--add-watch host remote (nth 1 args) (nth 2 args)))
      ((eq operation 'process-file)
       (angelia-client-files--process-file host remote-dir args))
      ((eq operation 'start-file-process)

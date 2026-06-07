@@ -31,6 +31,15 @@ C-x C-f /@angelia:HOST:/absolute/path
 
 `HOST` is whatever you'd pass to `ssh` (`localhost`, `myhost`, `user@host`, an `~/.ssh/config` alias, etc.). `dired` works on `/@angelia:HOST:/some/dir/` as well.
 
+## External-change detection & auto-revert
+
+Angelia records each visited file's real remote mtime, so `save-buffer` warns
+before clobbering a file that changed underneath you instead of silently
+overwriting it. `file-notify-add-watch` is implemented over a remote
+`file/watch` session (the server watches the real path and streams change
+events), so `auto-revert-mode` and log-tailing work on `/@angelia:` buffers
+wherever the remote host delivers file-notification events.
+
 ## Interactive commands
 
 | Command | Purpose |

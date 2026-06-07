@@ -14,6 +14,9 @@
 
 (require 'cl-lib)
 (require 'subr-x)
+;; `filenotify' backs `file/watch': the server watches real paths with the
+;; host's native notification backend (inotify on Linux) and streams changes.
+(require 'filenotify)
 
 ;; ---------------------------------------------------------------------------
 ;; Forward declarations.  Hoisted here so byte-compilation accepts closures
@@ -258,7 +261,10 @@ Called from `angelia-server--end-session' before the row is removed."
        (when (and proc (process-live-p proc))
          (ignore-errors (delete-process proc)))
        (when (and stderr-pipe (process-live-p stderr-pipe))
-         (ignore-errors (delete-process stderr-pipe)))))))
+         (ignore-errors (delete-process stderr-pipe)))))
+    ('file-watch
+     (let ((desc (plist-get state :descriptor)))
+       (when desc (ignore-errors (file-notify-rm-watch desc)))))))
 
 (defun angelia-server--end-session (conn session)
   "Emit a terminal `kind: \"end\"' event for SESSION and drop its state row.
@@ -808,6 +814,76 @@ PARAMS->file is the prefix being completed (default \"\")."
     (puthash "names" (vconcat matches) result)
     result))
 
+(defun angelia-server--watch-flags (flag-strs)
+  "Map FLAG-STRS (a vector/list of strings) to `file-notify-add-watch' flags.
+Recognises \"change\" and \"attribute-change\"; defaults to (change)."
+  (let ((flags '()))
+    (when (or (vectorp flag-strs) (listp flag-strs))
+      (mapc (lambda (s)
+              (cond ((equal s "change") (push 'change flags))
+                    ((equal s "attribute-change") (push 'attribute-change flags))))
+            (append flag-strs nil)))
+    (or flags '(change))))
+
+(defun angelia-server--emit-fsevent (conn session action file)
+  "Push an `fsevent' session event: ACTION (a string) on FILE's basename."
+  (let ((payload (make-hash-table :test #'equal)))
+    (puthash "action" action payload)
+    (puthash "file" (file-name-nondirectory (or file "")) payload)
+    (angelia-server--send-session-event conn session "fsevent" payload)))
+
+(defun angelia-server--make-watch-callback (conn session)
+  "Return a `file-notify' callback forwarding events on SESSION to CONN.
+Each event becomes a `kind: \"fsevent\"' carrying the basename of the changed
+file and the action string.  `renamed' is split into a `deleted' of the old
+name plus a `created' of the new, so the client's `file-notify-callback' (which
+drops a bare `renamed') still sees both halves.  `stopped' ends the session."
+  (lambda (event)
+    ;; EVENT = (DESCRIPTOR ACTION FILE [FILE1]).
+    (let ((action (nth 1 event))
+          (file   (nth 2 event))
+          (file1  (nth 3 event)))
+      (condition-case err
+          (pcase action
+            ('stopped (angelia-server--end-session conn session))
+            ('renamed
+             (angelia-server--emit-fsevent conn session "deleted" file)
+             (when file1
+               (angelia-server--emit-fsevent conn session "created" file1)))
+            (_ (angelia-server--emit-fsevent
+                conn session (symbol-name action) file)))
+        (error (angelia-server--log-error err))))))
+
+(defun angelia-server--file-watch (conn params)
+  "Watch PARAMS->path (a directory) and stream changes as session events.
+Returns {session}.  PARAMS->flags is an array of strings (\"change\",
+\"attribute-change\"); defaults to (\"change\").  The client always passes a
+directory (filenotify reduces a file watch to its parent) and filters by
+basename on its side, so this watches the whole directory."
+  (let* ((path (angelia-server--require-string-path "file/watch" params))
+         (flag-strs (and (hash-table-p params) (gethash "flags" params)))
+         (flags (angelia-server--watch-flags flag-strs))
+         (session (angelia-server--make-session-id))
+         (result (make-hash-table :test #'equal))
+         (desc (file-notify-add-watch
+                path flags
+                (angelia-server--make-watch-callback conn session))))
+    (angelia-server--register-session
+     session (list :kind 'file-watch :descriptor desc :path path))
+    (angelia-server--log "file/watch: session=%s path=%s flags=%S"
+                         session path flags)
+    (puthash "session" session result)
+    result))
+
+(defun angelia-server--file-unwatch (conn params)
+  "Stop the watch identified by PARAMS->session.  Returns t.
+`angelia-server--end-session' runs the `file-watch' cleanup (rm-watch) and
+emits the terminal `end' event."
+  (let ((session (and (hash-table-p params) (gethash "session" params))))
+    (unless (stringp session) (error "file/unwatch: missing string `session'"))
+    (angelia-server--end-session conn session)
+    t))
+
 (angelia-server-register-method "file/read"             #'angelia-server--file-read)
 (angelia-server-register-method "file/write-open"       #'angelia-server--file-write-open)
 (angelia-server-register-method "file/write-chunk"      #'angelia-server--file-write-chunk)
@@ -829,6 +905,8 @@ PARAMS->file is the prefix being completed (default \"\")."
 (angelia-server-register-method "file/writable-p"       #'angelia-server--file-writable-p)
 (angelia-server-register-method "file/executable-p"     #'angelia-server--file-executable-p)
 (angelia-server-register-method "file/completions"      #'angelia-server--file-completions)
+(angelia-server-register-method "file/watch"            #'angelia-server--file-watch)
+(angelia-server-register-method "file/unwatch"          #'angelia-server--file-unwatch)
 
 ;; ---------------------------------------------------------------------------
 ;; Remote process / PTY handlers.
