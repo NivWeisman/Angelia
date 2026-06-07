@@ -5,8 +5,14 @@
 ;; on a remote host can serve buffers visiting `/@angelia:HOST:/path' files.
 ;;
 ;; Each language server is a direct SSH stdio subprocess:
-;;   ssh HOST bash --login -c 'lsp-command'
-;; `bash --login' ensures PATH and env vars from login profiles are loaded.
+;;   ssh HOST <login-wrapped lsp-command>
+;; The remote command is built with `angelia-client--login-wrap' -- the same
+;; wrapper Angelia uses for the server launch and every `ssh-run' -- so the
+;; remote login environment (PATH, etc.) is loaded the way the host's actual
+;; login shell loads it: csh/tcsh source ~/.login, zsh source ~/.zprofile, and
+;; only sh/bash fall back to `bash --login'.  A hardcoded `bash --login -c'
+;; (CLAUDE.md rule 5) silently fails to find the language server on PATH on
+;; zsh/csh hosts -- which `brew shellenv' targets on modern macOS.
 ;; The language server's stdin/stdout carry Content-Length-framed LSP messages
 ;; directly; no Angelia JSON-RPC involvement in the data path.
 ;;
@@ -20,6 +26,9 @@
 (require 'cl-lib)
 (require 'subr-x)
 (require 'angelia-client-files)
+;; For `angelia-client--login-wrap': the language server launch must load the
+;; remote login env the host's own shell way, not via a hardcoded `bash --login'.
+(require 'angelia-client-deploy)
 
 ;; ---------------------------------------------------------------------------
 ;; URI mapping.
@@ -49,15 +58,15 @@ Returns nil when URI does not start with \"file://\" (callers should fall throug
 
 (defun angelia-client-lsp--make-process (host lsp-command)
   "Spawn LSP-COMMAND on HOST via SSH and return the live process object.
-The command is passed as a single SSH argument so sshd routes it through
-the user's default login shell first (loading env vars), then
-`bash --login -c' ensures bash runs the actual command with login profiles."
+The remote command is built with `angelia-client--login-wrap', so HOST's own
+login shell loads its login environment (PATH, etc.) before exec-ing the
+language server -- the same path Angelia uses everywhere else.  LSP-COMMAND
+must contain no single quotes (a csh login-wrap constraint)."
   (angelia-client--log "lsp: spawn host=%s cmd=%s" host lsp-command)
   (make-process
    :name            (format "angelia-lsp<%s>" host)
    :command         (list angelia-client-ssh-program host
-                          (format "bash --login -c %s"
-                                  (angelia-client--unix-quote lsp-command)))
+                          (angelia-client--login-wrap host lsp-command))
    :connection-type 'pipe
    :coding          'binary
    :noquery         t))
@@ -168,8 +177,7 @@ when translating file:// URIs back to /@angelia: paths."
                          (let ((h host) (c lsp-command))
                            (lambda ()
                              (list angelia-client-ssh-program h
-                                   (format "bash --login -c %s"
-                                           (angelia-client--unix-quote c))))))
+                                   (angelia-client--login-wrap h c)))))
         :major-modes    (list mode)
         :priority       10
         :activation-fn  (let ((h host))

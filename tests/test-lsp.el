@@ -50,6 +50,37 @@
   (should (null (angelia-client-lsp--uri-to-path "host" "http://example.com/foo"))))
 
 ;; ---------------------------------------------------------------------------
+;; Layer 0 — launch command routes through login-wrap (no SSH; make-process and
+;; the shell-family probe are both mocked).
+
+(ert-deftest test-lsp-make-process-uses-login-wrap ()
+  "The LSP subprocess command is built via `angelia-client--login-wrap', not a
+hardcoded `bash --login -c' (CLAUDE.md rule 5).  On a zsh host that distinction
+is load-bearing: `bash --login' never sources ~/.zprofile, so the language
+server would not be on PATH."
+  (let (captured)
+    (cl-letf (((symbol-function 'angelia-client--detect-shell-family)
+               (lambda (_host) 'zsh))
+              ((symbol-function 'make-process)
+               (lambda (&rest args)
+                 (setq captured (plist-get args :command))
+                 'dummy-proc)))
+      (let* ((host "someuser@zsh-host")
+             (cmd "pylsp")
+             (proc (angelia-client-lsp--make-process host cmd))
+             (remote-arg (nth 2 captured)))
+        (should (eq proc 'dummy-proc))
+        (should (equal (nth 0 captured) angelia-client-ssh-program))
+        (should (equal (nth 1 captured) host))
+        ;; The remote command is exactly login-wrap's output...
+        (should (equal remote-arg (angelia-client--login-wrap host cmd)))
+        ;; ...which on a zsh host sources ~/.zprofile and execs bash, and never
+        ;; uses the broken hardcoded `bash --login'.
+        (should (string-match-p "zprofile" remote-arg))
+        (should (string-match-p "exec bash -c" remote-arg))
+        (should-not (string-match-p "bash --login" remote-arg))))))
+
+;; ---------------------------------------------------------------------------
 ;; Layer 2 — process lifecycle (SSH localhost).
 
 (defconst angelia-tests--lsp-host "localhost"
