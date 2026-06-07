@@ -19,6 +19,8 @@
 ;; `filenotify' gives us `file-notify-callback', the entry point that feeds
 ;; remote change events back into Emacs's watch machinery (auto-revert, etc.).
 (require 'filenotify)
+;; `grep' provides `grep-mode' for the `angelia-grep' results buffer.
+(require 'grep)
 
 ;; ---------------------------------------------------------------------------
 ;; Path syntax.
@@ -215,6 +217,94 @@ Added to `angelia-client-after-connect-functions'; a no-op on the first connect.
 ;; restores them transparently once it comes back (Step 3).
 (add-hook 'angelia-client-after-connect-functions
           #'angelia-client-files--reregister-watches)
+
+;; ---------------------------------------------------------------------------
+;; Remote search (Step 4).  One `file/search' session runs rg/grep on the remote
+;; host and streams hits, instead of fanning out a process-file per file (the
+;; pattern the TRAMP comparison punished).
+
+(defcustom angelia-client-files-search-max 2000
+  "Cap on matches a single `angelia-grep' / `file/search' returns (0 = no cap)."
+  :type 'integer
+  :group 'angelia)
+
+(defun angelia-client-files--search-params (remote regexp max)
+  "Build the `file/search' params hash for REMOTE dir, REGEXP, and MAX cap."
+  (let ((p (angelia-client-files--params "path" remote "regexp" regexp)))
+    (when (and (integerp max) (> max 0)) (puthash "max" max p))
+    p))
+
+(defun angelia-client-files-search (host remote regexp &optional max)
+  "Search the REMOTE directory on HOST for REGEXP; block until done.
+Returns a list of (FILE LINE COL TEXT), FILE an Angelia URL.  MAX caps the
+result count (default `angelia-client-files-search-max')."
+  (let ((matches '())
+        (ended nil)
+        (cap (or max angelia-client-files-search-max)))
+    (angelia-client-open-session
+     host 'file/search
+     (angelia-client-files--search-params remote regexp cap)
+     (lambda (kind params)
+       (when (equal kind "match")
+         (push (list (angelia-client-files--make-path host (plist-get params :file))
+                     (plist-get params :line)
+                     (plist-get params :col)
+                     (plist-get params :text))
+               matches)))
+     :on-end (lambda (_p) (setq ended t)))
+    (with-timeout (angelia-client-files--io-timeout
+                   (error "file/search timed out for %s" remote))
+      (while (not ended) (accept-process-output nil 0.05)))
+    (nreverse matches)))
+
+(defun angelia-grep (dir regexp &optional max)
+  "Search the Angelia directory DIR for REGEXP, streaming hits to a grep buffer.
+RET on a line jumps to the match (through the Angelia file handler).  DIR
+defaults to `default-directory' when it is already an Angelia path."
+  (interactive
+   (let* ((d (if (and (stringp default-directory)
+                      (angelia-client-files--parse default-directory))
+                 default-directory
+               (read-string "Angelia search dir (/@angelia:HOST:/path): ")))
+          (r (read-string "Search regexp: ")))
+     (list d r angelia-client-files-search-max)))
+  (let* ((parsed (or (angelia-client-files--parse dir)
+                     (error "angelia-grep: not an Angelia directory: %s" dir)))
+         (host (car parsed))
+         (remote (cdr parsed))
+         (buf (get-buffer-create "*angelia-grep*")))
+    (angelia-client-files--ensure-connection host)
+    (with-current-buffer buf
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert (format "-*- mode: grep -*-\n\nAngelia search: %s  in  %s\n\n"
+                        regexp dir)))
+      (grep-mode)
+      (setq-local default-directory dir))
+    (display-buffer buf)
+    (angelia-client-open-session
+     host 'file/search
+     (angelia-client-files--search-params remote regexp
+                                          (or max angelia-client-files-search-max))
+     (lambda (kind params)
+       (when (and (equal kind "match") (buffer-live-p buf))
+         (with-current-buffer buf
+           (let ((inhibit-read-only t))
+             (save-excursion
+               (goto-char (point-max))
+               (insert (format "%s:%s:%s:%s\n"
+                               (angelia-client-files--make-path
+                                host (plist-get params :file))
+                               (plist-get params :line)
+                               (plist-get params :col)
+                               (plist-get params :text))))))))
+     :on-end (lambda (_p)
+               (when (buffer-live-p buf)
+                 (with-current-buffer buf
+                   (let ((inhibit-read-only t))
+                     (save-excursion (goto-char (point-max))
+                                     (insert "\nSearch finished\n")))))))
+    buf))
 
 (defun angelia-client-files--insert-file-contents (host remote args)
   "Read REMOTE on HOST via chunked `file/read' and insert the bytes here.

@@ -569,4 +569,37 @@ contaminates the result."
     ;; Generous lower bound (40ms) to tolerate timer granularity, no upper bound.
     (should (>= (float-time (time-subtract (current-time) t0)) 0.04))))
 
+;; ---------------------------------------------------------------------------
+;; file/search line parsing (covers both rg and grep output shapes).
+
+(defun angelia-tests--parse-search-line (line)
+  "Run `angelia-server--emit-search-line' on LINE, returning the match payload
+hash (or nil when LINE is not a hit)."
+  (let (payload)
+    (cl-letf (((symbol-function 'angelia-server--send-session-event)
+               (lambda (_c _s _kind p) (setq payload p))))
+      (and (angelia-server--emit-search-line nil "s" line) payload))))
+
+(ert-deftest test-search-line-parse-rg ()
+  "rg --vimgrep output (file:line:col:text) parses into all four fields."
+  (let ((p (angelia-tests--parse-search-line "/a/b.txt:12:5:hello world")))
+    (should p)
+    (should (equal (gethash "file" p) "/a/b.txt"))
+    (should (= (gethash "line" p) 12))
+    (should (= (gethash "col" p) 5))
+    (should (equal (gethash "text" p) "hello world"))))
+
+(ert-deftest test-search-line-parse-grep ()
+  "grep -rnH output (file:line:text) parses with col defaulted to 0."
+  (let ((p (angelia-tests--parse-search-line "/a/b.txt:12:hello world")))
+    (should p)
+    (should (equal (gethash "file" p) "/a/b.txt"))
+    (should (= (gethash "line" p) 12))
+    (should (= (gethash "col" p) 0))
+    (should (equal (gethash "text" p) "hello world"))))
+
+(ert-deftest test-search-line-parse-nonmatch ()
+  "A non-grep line is not emitted as a match."
+  (should (null (angelia-tests--parse-search-line "this is not a grep line"))))
+
 ;;; test-server-unit.el ends here

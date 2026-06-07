@@ -51,11 +51,20 @@ connection. An explicit `M-x angelia-client-disconnect` is never auto-reconnecte
 Tunables: `angelia-client-auto-reconnect`, `angelia-client-keepalive-interval`,
 `angelia-client-reconnect-max-attempts`.
 
+## Remote search
+
+`M-x angelia-grep` runs `rg` (or `grep`) **on the remote host** and streams the
+hits into a `grep-mode` buffer — RET jumps to a match through the file handler.
+One `file/search` session does the whole tree, instead of fanning out a
+round-trip per file. Defaults to `default-directory` when it is already an
+Angelia path; capped by `angelia-client-files-search-max`.
+
 ## Interactive commands
 
 | Command | Purpose |
 |---|---|
 | `M-x angelia-client-connect`         | Connect to a host explicitly (otherwise opening a remote file connects on demand). |
+| `M-x angelia-grep`                   | Stream `rg`/`grep` results from the remote host into a `grep-mode` buffer. |
 | `M-x angelia-client-disconnect`      | Tear down a connection. |
 | `M-x angelia-client-send-ping`       | Round-trip ping; reports milliseconds. |
 | `M-x angelia-client-server-info`     | Show remote Emacs version, server hash, PID, uptime. |

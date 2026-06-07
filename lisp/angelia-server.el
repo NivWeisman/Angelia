@@ -884,6 +884,78 @@ emits the terminal `end' event."
     (angelia-server--end-session conn session)
     t))
 
+(defun angelia-server--search-argv (regexp dir)
+  "Return the search command line for REGEXP under DIR.
+Prefers `rg --vimgrep' (file:line:col:text); falls back to `grep -rnH'
+\(file:line:text).  DIR is passed absolute so emitted paths are absolute."
+  (if (executable-find "rg")
+      (list "rg" "--vimgrep" "--no-heading" "--color=never" "--" regexp dir)
+    (list "grep" "-rnH" "--" regexp dir)))
+
+(defun angelia-server--emit-search-line (conn session line)
+  "Parse one vimgrep/grep LINE and emit a `match' event; non-nil if emitted.
+Handles both `file:line:col:text' (rg) and `file:line:text' (grep, col 0)."
+  (when (string-match
+         "\\`\\(.+?\\):\\([0-9]+\\):\\(?:\\([0-9]+\\):\\)?\\(.*\\)\\'" line)
+    (let ((payload (make-hash-table :test #'equal)))
+      (puthash "file" (match-string 1 line) payload)
+      (puthash "line" (string-to-number (match-string 2 line)) payload)
+      (puthash "col" (if (match-string 3 line)
+                         (string-to-number (match-string 3 line)) 0)
+               payload)
+      (puthash "text" (match-string 4 line) payload)
+      (angelia-server--send-session-event conn session "match" payload)
+      t)))
+
+(defun angelia-server--file-search (conn params)
+  "Stream search hits under PARAMS->path matching PARAMS->regexp.
+Returns {session}.  Emits `session/event {kind:\"match\", file, line, col, text}'
+per hit and a terminal `kind:\"end\"' when the search process exits.
+PARAMS->max (>0) caps emitted matches; the process is killed once the cap is
+reached.  The session is `:kind proc' so the standard cleanup kills the process
+if the client abandons it."
+  (let* ((dir (angelia-server--require-string-path "file/search" params))
+         (regexp (and (hash-table-p params) (gethash "regexp" params)))
+         (max (and (hash-table-p params) (gethash "max" params)))
+         (cap (if (and (integerp max) (> max 0)) max 0)))
+    (unless (stringp regexp) (error "file/search: missing string `regexp'"))
+    (let* ((session (angelia-server--make-session-id))
+           (count 0)
+           (buffer "")
+           (proc nil))
+      (setq proc
+            (make-process
+             :name (format "angelia-search-%s" session)
+             :command (angelia-server--search-argv regexp dir)
+             :coding 'utf-8
+             :connection-type 'pipe
+             :noquery t
+             :filter
+             (lambda (_p chunk)
+               (setq buffer (concat buffer chunk))
+               (let (nl)
+                 (while (setq nl (string-match "\n" buffer))
+                   (let ((line (substring buffer 0 nl)))
+                     (setq buffer (substring buffer (1+ nl)))
+                     (when (and (> (length line) 0)
+                                (or (= cap 0) (< count cap))
+                                (angelia-server--emit-search-line
+                                 conn session line))
+                       (setq count (1+ count))
+                       (when (and (> cap 0) (>= count cap) (process-live-p proc))
+                         (ignore-errors (delete-process proc))))))))
+             :sentinel
+             (lambda (p _event)
+               (when (memq (process-status p)
+                           '(exit signal failed closed))
+                 (angelia-server--end-session conn session)))))
+      (angelia-server--register-session
+       session (list :kind 'proc :process proc))
+      (angelia-server--log "file/search: session=%s dir=%s cap=%d" session dir cap)
+      (let ((result (make-hash-table :test #'equal)))
+        (puthash "session" session result)
+        result))))
+
 (angelia-server-register-method "file/read"             #'angelia-server--file-read)
 (angelia-server-register-method "file/write-open"       #'angelia-server--file-write-open)
 (angelia-server-register-method "file/write-chunk"      #'angelia-server--file-write-chunk)
@@ -907,6 +979,7 @@ emits the terminal `end' event."
 (angelia-server-register-method "file/completions"      #'angelia-server--file-completions)
 (angelia-server-register-method "file/watch"            #'angelia-server--file-watch)
 (angelia-server-register-method "file/unwatch"          #'angelia-server--file-unwatch)
+(angelia-server-register-method "file/search"           #'angelia-server--file-search)
 
 ;; ---------------------------------------------------------------------------
 ;; Remote process / PTY handlers.
