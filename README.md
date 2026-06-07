@@ -51,6 +51,13 @@ connection. An explicit `M-x angelia-client-disconnect` is never auto-reconnecte
 Tunables: `angelia-client-auto-reconnect`, `angelia-client-keepalive-interval`,
 `angelia-client-reconnect-max-attempts`.
 
+## Edit locking
+
+`lock-file` / `unlock-file` / `file-locked-p` are backed by Emacs-style `.#NAME`
+lock symlinks on the remote host, so a second client editing the same file is
+detected. Auto-locking is opt-in: set `angelia-client-files-enable-locks` to
+re-enable `create-lockfiles` on Angelia buffers (off by default).
+
 ## Remote search
 
 `M-x angelia-grep` runs `rg` (or `grep`) **on the remote host** and streams the

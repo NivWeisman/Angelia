@@ -151,4 +151,15 @@
         (set-file-modes dir #o755)
         (when (file-directory-p dir) (delete-directory dir t))))))
 
+(ert-deftest test-file-system-info-remote ()
+  "`file-system-info' returns (TOTAL FREE AVAIL) positive integers for a remote
+directory (dired's free-space line)."
+  (angelia-tests-ensure-no-connections)
+  (with-angelia-connection angelia-tests--dired-host _conn
+    (angelia-tests--with-dired-tmpdir dir
+      (let ((info (file-system-info (angelia-tests--dired-remote dir))))
+        (should (consp info))
+        (should (= 3 (length info)))
+        (should (cl-every (lambda (n) (and (integerp n) (> n 0))) info))))))
+
 ;;; test-dired.el ends here

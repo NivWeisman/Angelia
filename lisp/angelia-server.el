@@ -956,6 +956,58 @@ if the client abandons it."
         (puthash "session" session result)
         result))))
 
+(defun angelia-server--file-system-info (_conn params)
+  "Return {total, free, avail} bytes for PARAMS->path's filesystem.
+The server runs on the remote host, so its own `file-system-info' already
+reports the right device; empty hash when the platform can't answer."
+  (let* ((path (angelia-server--require-string-path "file/fs-info" params))
+         (info (file-system-info path))
+         (h (make-hash-table :test #'equal)))
+    (when info
+      (puthash "total" (nth 0 info) h)
+      (puthash "free"  (nth 1 info) h)
+      (puthash "avail" (nth 2 info) h))
+    h))
+
+(defun angelia-server--lockfile (path)
+  "Return the Emacs-style lock path (`.#NAME') beside PATH."
+  (let* ((abs (expand-file-name path))
+         (dir (file-name-directory abs))
+         (base (file-name-nondirectory (directory-file-name abs))))
+    (concat dir ".#" base)))
+
+(defun angelia-server--file-lock (_conn params)
+  "Create PATH's lock symlink (`.#NAME' -> PARAMS->owner), stealing any prior.
+Matches Emacs's own lock convention (a dangling symlink whose target is the
+owner string), so a local Emacs editing the same file interoperates.  Returns t."
+  (let ((path (angelia-server--require-string-path "file/lock" params))
+        (owner (and (hash-table-p params) (gethash "owner" params))))
+    (unless (stringp owner) (error "file/lock: missing string `owner'"))
+    (let ((lock (angelia-server--lockfile path)))
+      (ignore-errors (delete-file lock))
+      (make-symbolic-link owner lock t))
+    t))
+
+(defun angelia-server--file-unlock (_conn params)
+  "Remove PATH's lock symlink when it is owned by PARAMS->owner (or owner nil).
+Returns t."
+  (let* ((path (angelia-server--require-string-path "file/unlock" params))
+         (owner (and (hash-table-p params) (gethash "owner" params)))
+         (lock (angelia-server--lockfile path))
+         (target (file-symlink-p lock)))
+    (when (and target (or (null owner) (equal target owner)))
+      (ignore-errors (delete-file lock)))
+    t))
+
+(defun angelia-server--file-locked-p (_conn params)
+  "Return {owner: <lock owner string> | :null} for PARAMS->path."
+  (let* ((path (angelia-server--require-string-path "file/locked-p" params))
+         (lock (angelia-server--lockfile path))
+         (target (file-symlink-p lock))
+         (h (make-hash-table :test #'equal)))
+    (puthash "owner" (if (stringp target) target :null) h)
+    h))
+
 (angelia-server-register-method "file/read"             #'angelia-server--file-read)
 (angelia-server-register-method "file/write-open"       #'angelia-server--file-write-open)
 (angelia-server-register-method "file/write-chunk"      #'angelia-server--file-write-chunk)
@@ -980,6 +1032,10 @@ if the client abandons it."
 (angelia-server-register-method "file/watch"            #'angelia-server--file-watch)
 (angelia-server-register-method "file/unwatch"          #'angelia-server--file-unwatch)
 (angelia-server-register-method "file/search"           #'angelia-server--file-search)
+(angelia-server-register-method "file/fs-info"          #'angelia-server--file-system-info)
+(angelia-server-register-method "file/lock"             #'angelia-server--file-lock)
+(angelia-server-register-method "file/unlock"           #'angelia-server--file-unlock)
+(angelia-server-register-method "file/locked-p"         #'angelia-server--file-locked-p)
 
 ;; ---------------------------------------------------------------------------
 ;; Remote process / PTY handlers.

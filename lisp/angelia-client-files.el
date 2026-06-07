@@ -306,6 +306,53 @@ defaults to `default-directory' when it is already an Angelia path."
                                      (insert "\nSearch finished\n")))))))
     buf))
 
+;; ---------------------------------------------------------------------------
+;; File-handler completeness + remote edit locking (Step 5).
+
+(defcustom angelia-client-files-enable-locks nil
+  "When non-nil, take real remote edit locks on Angelia buffers.
+Off by default: Angelia buffers keep `create-lockfiles' nil (no lock files),
+preserving today's behaviour.  Enabling it makes editing a remote buffer create
+an Emacs-style `.#NAME' lock on the remote host, so a second client detects the
+in-progress edit via `file-locked-p'.  `lock-file' / `unlock-file' /
+`file-locked-p' work regardless of this flag; it only controls auto-locking."
+  :type 'boolean
+  :group 'angelia)
+
+(defun angelia-client-files--lock-owner ()
+  "Return this Emacs's lock-owner string, Emacs's `user@host.pid' convention."
+  (format "%s@%s.%d" (user-login-name) (system-name) (emacs-pid)))
+
+(defun angelia-client-files--file-newer-than (host remote other)
+  "Implement `file-newer-than-file-p': is REMOTE on HOST newer than OTHER?
+OTHER is the second argument (any file name).  t when REMOTE exists and OTHER
+is older or absent; nil when REMOTE is absent."
+  (let* ((a (angelia-client-files--file-attributes host remote))
+         (other-parsed (angelia-client-files--parse other))
+         (b (and other-parsed
+                 (angelia-client-files--file-attributes
+                  (car other-parsed) (cdr other-parsed)))))
+    (cond ((null a) nil)
+          ((null b) t)
+          (t (time-less-p (nth 5 b) (nth 5 a))))))
+
+(defun angelia-client-files--system-info (host remote)
+  "Implement `file-system-info': return (TOTAL FREE AVAIL) bytes or nil."
+  (let* ((resp (angelia-client-call host 'file/fs-info
+                                    (angelia-client-files--params "path" remote)))
+         (total (plist-get resp :total)))
+    (when total
+      (list total (plist-get resp :free) (plist-get resp :avail)))))
+
+(defun angelia-client-files--locked-p (host remote)
+  "Implement `file-locked-p': nil (unlocked), t (locked by us), or owner string."
+  (let* ((resp (angelia-client-call host 'file/locked-p
+                                    (angelia-client-files--params "path" remote)))
+         (owner (plist-get resp :owner)))
+    (cond ((or (null owner) (eq owner :null)) nil)
+          ((equal owner (angelia-client-files--lock-owner)) t)
+          (t owner))))
+
 (defun angelia-client-files--insert-file-contents (host remote args)
   "Read REMOTE on HOST via chunked `file/read' and insert the bytes here.
 ARGS is the full argument list to `insert-file-contents'.  Chunks arrive
@@ -354,13 +401,13 @@ callback then insert the joined bytes (decoded as UTF-8) at point."
         ;; later external edit makes `verify-visited-file-modtime' return nil
         ;; and the user is warned instead of silently clobbering the change.
         (angelia-client-files--record-visited-modtime host remote)
-        ;; Disable on-save backups + lockfiles + autosave for this buffer.
-        ;; Each of those tries to operate on the local fs path, which doesn't
-        ;; exist; the result is `save-buffer' failing with `file-missing'.
-        ;; The user can opt back in by clearing these locals if they want
-        ;; remote backups (which would need their own RPC handlers).
+        ;; Disable on-save backups + autosave for this buffer: each operates on
+        ;; the local fs path, which doesn't exist, so `save-buffer' would fail
+        ;; with `file-missing'.  Lock files, by contrast, now have working
+        ;; remote handlers, so honour `angelia-client-files-enable-locks'
+        ;; (default nil keeps today's no-lock behaviour).
         (setq-local backup-inhibited t)
-        (setq-local create-lockfiles nil)
+        (setq-local create-lockfiles angelia-client-files-enable-locks)
         (auto-save-mode -1))
       (list filename (length selected)))))
 
@@ -812,6 +859,38 @@ Unrecognized operations fall through to the default handler chain."
      ((eq operation 'file-regular-p)
       (let ((attrs (angelia-client-files--file-attributes host remote)))
         (and attrs (null (car attrs)))))
+     ((eq operation 'file-equal-p)
+      ;; Two files are equal iff same host + same normalized remote path.  The
+      ;; default delegation wrongly returns t for any two angelia paths (it
+      ;; stats the literal URLs locally), so we must answer here.
+      (let ((other (angelia-client-files--parse (nth 1 args))))
+        (and other (equal host (car other))
+             (equal (angelia-client-files--normalize-remote remote)
+                    (angelia-client-files--normalize-remote (cdr other))))))
+     ((eq operation 'file-newer-than-file-p)
+      (angelia-client-files--file-newer-than host remote (nth 1 args)))
+     ((eq operation 'access-file)
+      ;; Signal like the local primitive when the file is not accessible.
+      (unless (angelia-client-files--rpc-bool host 'file/exists remote)
+        (signal 'file-missing (list (or (nth 1 args) "Opening input file")
+                                    (nth 0 args))))
+      nil)
+     ((eq operation 'file-system-info)
+      (angelia-client-files--system-info host remote))
+     ((eq operation 'lock-file)
+      (angelia-client-call host 'file/lock
+                           (angelia-client-files--params
+                            "path" remote
+                            "owner" (angelia-client-files--lock-owner)))
+      nil)
+     ((eq operation 'unlock-file)
+      (angelia-client-call host 'file/unlock
+                           (angelia-client-files--params
+                            "path" remote
+                            "owner" (angelia-client-files--lock-owner)))
+      nil)
+     ((eq operation 'file-locked-p)
+      (angelia-client-files--locked-p host remote))
      ((eq operation 'file-attributes)
       (angelia-client-files--file-attributes host remote))
      ((eq operation 'file-modes)

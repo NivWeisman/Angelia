@@ -205,4 +205,66 @@ validates the chunk loop under volume and the absence of byte loss."
               (should (equal got expected))))
         (when (file-exists-p local) (delete-file local))))))
 
+;; ---------------------------------------------------------------------------
+;; File-handler completeness + remote edit locking (Step 5).
+
+(ert-deftest test-file-equal-p-remote ()
+  "`file-equal-p' is true for the same remote path, false for different ones.
+\(The default delegation wrongly returns t for any two angelia paths.)"
+  (angelia-tests--file-ops-setup)
+  (with-angelia-connection angelia-tests--target-host _conn
+    (angelia-tests--with-remote-temp-file a "a\n"
+      (angelia-tests--with-remote-temp-file b "b\n"
+        (let ((ra (angelia-tests--remote a))
+              (rb (angelia-tests--remote b)))
+          (should (file-equal-p ra ra))
+          (should-not (file-equal-p ra rb)))))))
+
+(ert-deftest test-file-newer-than-remote ()
+  "`file-newer-than-file-p' reflects the remote mtimes."
+  (angelia-tests--file-ops-setup)
+  (with-angelia-connection angelia-tests--target-host _conn
+    (angelia-tests--with-remote-temp-file old "old\n"
+      (angelia-tests--with-remote-temp-file new "new\n"
+        ;; Force a clear mtime ordering regardless of filesystem granularity.
+        (set-file-times old (time-subtract (current-time) 100))
+        (let ((rold (angelia-tests--remote old))
+              (rnew (angelia-tests--remote new)))
+          (should (file-newer-than-file-p rnew rold))
+          (should-not (file-newer-than-file-p rold rnew))
+          ;; Newer than an absent file is always true.
+          (should (file-newer-than-file-p
+                   rnew (angelia-tests--remote "/no/such/file/xyz"))))))))
+
+(ert-deftest test-access-file-remote ()
+  "`access-file' returns nil for a readable file and signals for a missing one."
+  (angelia-tests--file-ops-setup)
+  (with-angelia-connection angelia-tests--target-host _conn
+    (angelia-tests--with-remote-temp-file f "x\n"
+      (should (null (access-file (angelia-tests--remote f) "open")))
+      (should-error
+       (access-file (angelia-tests--remote "/no/such/path/xyz-9") "open")))))
+
+(ert-deftest test-file-locks-roundtrip ()
+  "lock-file / file-locked-p / unlock-file round-trip, and a foreign owner is
+reported as a string (not t)."
+  (angelia-tests--file-ops-setup)
+  (with-angelia-connection angelia-tests--target-host _conn
+    (angelia-tests--with-remote-temp-file f "x\n"
+      (let ((url (angelia-tests--remote f)))
+        ;; Unlocked to start.
+        (should (null (file-locked-p url)))
+        ;; We take the lock -> reported as ours (t).
+        (lock-file url)
+        (should (eq t (file-locked-p url)))
+        ;; A foreign owner is reported verbatim, not as t.
+        (angelia-client-call angelia-tests--target-host 'file/lock
+                             (angelia-client-files--params
+                              "path" f "owner" "someone@elsewhere.999"))
+        (should (equal (file-locked-p url) "someone@elsewhere.999"))
+        ;; Re-take and release.
+        (lock-file url)
+        (unlock-file url)
+        (should (null (file-locked-p url)))))))
+
 ;;; test-file-ops.el ends here
