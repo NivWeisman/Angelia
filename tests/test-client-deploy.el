@@ -98,4 +98,12 @@ This is the macOS-default-shell path: /opt/homebrew/bin reaches PATH only via
     ;; The literal $f must be inside single quotes (not expanded by zsh).
     (should (string-match-p "exec bash -c 'X=\"\\$f\" emacs'" w))))
 
+(ert-deftest test-client-login-wrap-rejects-single-quotes ()
+  "A wrapped command containing a single quote is rejected up front.
+csh single-quoting is literal (cannot embed quotes), so such a command
+would break in shell-family-dependent ways; the wrap asserts the CLAUDE.md
+invariant instead of trusting callers (e.g. user-supplied LSP commands)."
+  (dolist (family '(sh csh zsh))
+    (should-error (angelia-client-tests--wrap-for family "echo 'hi'"))))
+
 ;;; test-client-deploy.el ends here

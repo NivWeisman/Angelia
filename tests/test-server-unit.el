@@ -602,4 +602,40 @@ hash (or nil when LINE is not a hit)."
   "A non-grep line is not emitted as a match."
   (should (null (angelia-tests--parse-search-line "this is not a grep line"))))
 
+;; ---------------------------------------------------------------------------
+;; Error logging: backtraces must reach stderr and never leak into a buffer.
+
+(ert-deftest test-server-log-error-backtrace ()
+  "`angelia-server--log-error' logs a non-empty backtrace, stderr only.
+Regression: the old `with-output-to-string' misuse re-bound
+`standard-output' to the current buffer, so the logged string was always
+empty AND the backtrace text was injected into whatever buffer was current."
+  (let ((lines '()))
+    (cl-letf (((symbol-function 'angelia-server--log)
+               (lambda (fmt &rest args) (push (apply #'format fmt args) lines))))
+      (with-temp-buffer
+        (insert "SENTINEL")
+        (condition-case err
+            (error "kaboom-for-backtrace")
+          (error (angelia-server--log-error err)))
+        ;; The current buffer must be untouched.
+        (should (equal (buffer-string) "SENTINEL"))))
+    (should (cl-some (lambda (l) (string-match-p "kaboom-for-backtrace" l))
+                     lines))
+    (should (cl-some (lambda (l)
+                       (and (string-prefix-p "Backtrace:\n" l)
+                            (> (length l) 20)))
+                     lines))))
+
+;; ---------------------------------------------------------------------------
+;; ERE quoting for the dtach pkill pattern.
+
+(ert-deftest test-server-ere-quote ()
+  "ERE metacharacters are backslash-escaped; plain paths pass through."
+  (should (equal "/tmp/plain/x_sock"
+                 (angelia-server--ere-quote "/tmp/plain/x_sock")))
+  (should (equal "a\\.b\\+c" (angelia-server--ere-quote "a.b+c")))
+  (should (equal "\\[x\\]\\{2\\}\\(y\\)\\|z\\*\\?\\^\\$\\\\"
+                 (angelia-server--ere-quote "[x]{2}(y)|z*?^$\\"))))
+
 ;;; test-server-unit.el ends here

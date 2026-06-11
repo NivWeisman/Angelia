@@ -72,12 +72,14 @@ warning.")
          #'external-debugging-output))
 
 (defun angelia-server--log-error (err)
-  "Log error ERR (a `condition-case' object) and a backtrace to stderr."
+  "Log error ERR (a `condition-case' object) and a backtrace to stderr.
+`with-output-to-string' already binds `standard-output' to its own hidden
+buffer; `backtrace' prints there.  (Re-binding `standard-output' to
+`(current-buffer)' inside it -- a past bug -- yielded an empty string AND
+dumped the backtrace into whatever buffer was current.)"
   (angelia-server--log "ERROR %S: %s" (car err) (error-message-string err))
-  (let ((bt (with-output-to-string
-              (let ((standard-output (current-buffer)))
-                (backtrace)))))
-    (when (and bt (> (length bt) 0))
+  (let ((bt (with-output-to-string (backtrace))))
+    (when (> (length bt) 0)
       (angelia-server--log "Backtrace:\n%s" bt))))
 
 (defun angelia-server--truncate (s n)
@@ -608,31 +610,41 @@ events for a session it has not yet registered a callback for."
        session (list :kind 'file-read :path path :size size))
       (puthash "session" session result)
       (puthash "size" size result)
-      (run-at-time
-       0.005 nil
-       (lambda ()
-         (condition-case err
-             (let ((offset 0))
-               (while (< offset size)
-                 (let* ((end (min size (+ offset chunk-size)))
-                        (bytes (with-temp-buffer
-                                 (set-buffer-multibyte nil)
-                                 (insert-file-contents-literally
-                                  path nil offset end)
-                                 (buffer-string)))
-                        (payload (make-hash-table :test #'equal)))
-                   (puthash "data" (base64-encode-string bytes t) payload)
-                   (angelia-server--send-session-event
-                    conn session "chunk" payload)
-                   (setq offset end)))
-               (angelia-server--end-session conn session))
-           (error
-            (angelia-server--log-error err)
-            (let ((p (make-hash-table :test #'equal)))
-              (puthash "message" (error-message-string err) p)
-              (angelia-server--send-session-event
-               conn session "error" p))
-            (angelia-server--end-session conn session)))))
+      (let ((offset 0))
+        (cl-labels
+            ((step ()
+               ;; A vanished registry row means the client closed the
+               ;; session between chunks (session/close): stop streaming.
+               (when (gethash session angelia-server--sessions)
+                 (condition-case err
+                     (if (>= offset size)
+                         (angelia-server--end-session conn session)
+                       (let* ((end (min size (+ offset chunk-size)))
+                              (bytes (with-temp-buffer
+                                       (set-buffer-multibyte nil)
+                                       (insert-file-contents-literally
+                                        path nil offset end)
+                                       (buffer-string)))
+                              (payload (make-hash-table :test #'equal)))
+                         (puthash "data" (base64-encode-string bytes t)
+                                  payload)
+                         (angelia-server--send-session-event
+                          conn session "chunk" payload)
+                         (setq offset end)
+                         ;; Re-arm instead of looping: one chunk per timer
+                         ;; firing yields to the event loop, so other
+                         ;; requests (notably a cancelling session/close)
+                         ;; interleave with a large read instead of being
+                         ;; starved until the whole file has streamed.
+                         (run-at-time 0 nil #'step)))
+                   (error
+                    (angelia-server--log-error err)
+                    (let ((p (make-hash-table :test #'equal)))
+                      (puthash "message" (error-message-string err) p)
+                      (angelia-server--send-session-event
+                       conn session "error" p))
+                    (angelia-server--end-session conn session))))))
+          (run-at-time 0.005 nil #'step)))
       result)))
 
 (defun angelia-server--file-write-open (_conn params)
@@ -1417,6 +1429,16 @@ the two streams can be reported separately."
              (lambda (p event)
                (let ((status (process-status p)))
                  (when (memq status '(exit signal failed closed))
+                   ;; Drain pending stderr BEFORE reporting exit.  Emacs only
+                   ;; guarantees pending-output-before-sentinel for the
+                   ;; exiting process itself; the stderr sink is a separate
+                   ;; pipe process, so without this drain `--end-session'
+                   ;; would delete it with bytes still undelivered -- a
+                   ;; fast-exiting command lost part or all of its stderr.
+                   ;; JUST-THIS-ONE keeps the drain from re-entering the
+                   ;; stdin dispatcher.
+                   (when (process-live-p stderr-pipe)
+                     (while (accept-process-output stderr-pipe 0 nil t)))
                    (let* ((exit-code (process-exit-status p))
                           (signal-name
                            (angelia-server--proc-extract-signal-name event))
@@ -1502,6 +1524,13 @@ process command line, while `proc/list-persisted' / `proc/reattach' /
   "Return the dtach socket path for persisted session NAME."
   (expand-file-name (concat name ".sock") angelia-server--dtach-sock-dir))
 
+(defun angelia-server--ere-quote (s)
+  "Quote S for use as a literal inside a POSIX extended regexp.
+`regexp-quote' escapes for EMACS regexp syntax, which differs from the ERE
+that pkill/pgrep consume (e.g. Emacs leaves `+', `?', `{', `(' bare because
+they are literals unless backslashed -- in ERE they are operators)."
+  (replace-regexp-in-string "[][.^$*+?(){}|\\]" "\\\\\\&" s))
+
 (defun angelia-server--make-backend-dtach ()
   "Return the dtach backend struct."
   (angelia-server--proc-backend-create
@@ -1534,7 +1563,7 @@ process command line, while `proc/list-persisted' / `proc/reattach' /
        ;; clean up manually.
        (when (file-exists-p sock)
          (call-process "pkill" nil nil nil "-f"
-                       (regexp-quote sock))
+                       (angelia-server--ere-quote sock))
          (ignore-errors (delete-file sock)))
        t))))
 

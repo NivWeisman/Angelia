@@ -60,4 +60,43 @@
   (should (equal "~/x"           (angelia-client-files--join-remote "x" "~")))
   (should (equal "~bob/sub/x"    (angelia-client-files--join-remote "x" "~bob/sub"))))
 
+;; ---------------------------------------------------------------------------
+;; expand-file-name through the handler: a `~...' NAME must stay remote.
+
+(ert-deftest test-client-files-expand-tilde-name-stays-remote ()
+  "`~/x' against an angelia DIR is home-relative on the REMOTE host.
+Joining it through the local `expand-file-name' (the old behaviour) would
+substitute the LOCAL home directory into a remote path.  Seeds a fake
+connection row so `--ensure-connection' never dials out (Layer 0)."
+  (let ((host "tilde-test-host"))
+    (unwind-protect
+        (progn
+          (puthash host (angelia-client--conn-create :host host)
+                   angelia-client--connections)
+          (should (equal (format "/@angelia:%s:~/notes.org" host)
+                         (expand-file-name
+                          "~/notes.org" (format "/@angelia:%s:/srv/data" host))))
+          ;; Plain relative names still join onto the remote dir.
+          (should (equal (format "/@angelia:%s:/srv/data/x" host)
+                         (expand-file-name
+                          "x" (format "/@angelia:%s:/srv/data" host)))))
+      (remhash host angelia-client--connections))))
+
+;; ---------------------------------------------------------------------------
+;; ls-style mode string -> integer (backs the `file-modes' operation).
+
+(ert-deftest test-client-files-mode-string-to-number ()
+  "Nine permission chars plus setuid/setgid/sticky convert to the mode bits.
+Regression: this used to go through `file-modes-symbolic-to-number', which
+parses \"u+x\"-style specs and signals a parse error on ls output."
+  (should (equal #o755  (angelia-client-files--mode-string-to-number "drwxr-xr-x")))
+  (should (equal #o644  (angelia-client-files--mode-string-to-number "-rw-r--r--")))
+  (should (equal #o000  (angelia-client-files--mode-string-to-number "----------")))
+  (should (equal #o4755 (angelia-client-files--mode-string-to-number "-rwsr-xr-x")))
+  (should (equal #o4644 (angelia-client-files--mode-string-to-number "-rwSr--r--")))
+  (should (equal #o2755 (angelia-client-files--mode-string-to-number "-rwxr-sr-x")))
+  (should (equal #o1777 (angelia-client-files--mode-string-to-number "drwxrwxrwt")))
+  (should (null (angelia-client-files--mode-string-to-number "garbage")))
+  (should (null (angelia-client-files--mode-string-to-number nil))))
+
 ;;; test-client-files-unit.el ends here

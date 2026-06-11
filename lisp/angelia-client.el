@@ -35,9 +35,21 @@
 The `sessions' slot is a hash from server-issued session id (string) to a
 plist `(:on-event FN :on-end FN)' registered by `angelia-client-open-session'.
 The notification dispatcher in `angelia-client-connect' uses it to route
-`session/event' notifications back to the caller that opened them."
+`session/event' notifications back to the caller that opened them.
+
+`pending-events' buffers events that arrive for a session BEFORE its
+callbacks are registered: jsonrpc.el's process filter dispatches every
+complete message in one pass, so a response and its first notifications can
+both be processed before the synchronous requester regains control to
+register.  `angelia-client-register-session' replays the queue.
+
+`closed-sessions' holds tombstones (session id -> close time) for sessions
+this side closed on purpose, so their late events are dropped instead of
+queued."
   host process jsonrpc stderr-buffer
-  (sessions (make-hash-table :test #'equal)))
+  (sessions (make-hash-table :test #'equal))
+  (pending-events (make-hash-table :test #'equal))
+  (closed-sessions (make-hash-table :test #'equal)))
 
 (defvar angelia-client--connections (make-hash-table :test #'equal)
   "Map HOST (string) -> live `angelia-client--conn'.")
@@ -328,8 +340,47 @@ Currently only `session/event' is meaningful; everything else is logged."
       ;; Already logged above; nothing else to do.
       nil))))
 
+(defconst angelia-client--pending-events-ttl 30
+  "Seconds queued events for a never-registered session are kept before pruning.")
+
+(defconst angelia-client--pending-events-max 4096
+  "Cap on queued events per unregistered session; overflow events are dropped.")
+
+(defun angelia-client--prune-session-table (table)
+  "Drop entries of TABLE (id -> (TIME . _)) older than the pending-events TTL.
+Used for both the pending-event queues and the closed-session tombstones."
+  (let (stale)
+    (maphash (lambda (sid cell)
+               (let ((ts (if (consp cell) (car cell) cell)))
+                 (when (> (float-time (time-subtract (current-time) ts))
+                          angelia-client--pending-events-ttl)
+                   (push sid stale))))
+             table)
+    (dolist (sid stale) (remhash sid table))))
+
+(defun angelia-client--queue-pending-event (conn session params)
+  "Buffer PARAMS for SESSION on CONN until its callbacks are registered.
+The race this covers: jsonrpc.el dispatches every complete message in one
+process-filter pass, so the events following a method response can arrive
+before the requester has registered the session id the response carries.
+Dropping them loses chunks / exit events; queueing + replay on registration
+makes the stream lossless.  Queues are pruned after
+`angelia-client--pending-events-ttl' so an opener that never registers
+\(or events for a genuinely unknown session) cannot leak memory."
+  (let ((pending (angelia-client--conn-pending-events conn)))
+    (angelia-client--prune-session-table pending)
+    (let ((cell (or (gethash session pending)
+                    (puthash session (cons (current-time) nil) pending))))
+      (if (>= (length (cdr cell)) angelia-client--pending-events-max)
+          (angelia-client--log
+           "session/event overflow for unregistered session=%s (dropped)" session)
+        (setcdr cell (cons params (cdr cell)))))))
+
 (defun angelia-client--handle-session-event (host params)
-  "Look up the callback for PARAMS->session on HOST and dispatch it."
+  "Look up the callback for PARAMS->session on HOST and dispatch it.
+Events for a session with no registered callback are queued for replay
+\(see `angelia-client--queue-pending-event') unless the session was closed
+on purpose (tombstoned), in which case they are dropped."
   (let* ((conn (gethash host angelia-client--connections))
          (sessions (and conn (angelia-client--conn-sessions conn)))
          (session (plist-get params :session))
@@ -337,8 +388,17 @@ Currently only `session/event' is meaningful; everything else is logged."
          (entry (and sessions session (gethash session sessions))))
     (cond
      ((null entry)
-      (angelia-client--log
-       "session/event for unknown session=%s kind=%s (dropped)" session kind))
+      (cond
+       ((or (null conn) (not (stringp session)))
+        (angelia-client--log
+         "session/event for unknown session=%s kind=%s (dropped)" session kind))
+       ((gethash session (angelia-client--conn-closed-sessions conn))
+        (angelia-client--log
+         "session/event for closed session=%s kind=%s (dropped)" session kind))
+       (t
+        (angelia-client--log
+         "session/event for unregistered session=%s kind=%s (queued)" session kind)
+        (angelia-client--queue-pending-event conn session params))))
      ((equal kind "end")
       (let ((on-end (plist-get entry :on-end)))
         (remhash session sessions)
@@ -355,6 +415,40 @@ Currently only `session/event' is meaningful; everything else is logged."
              (angelia-client--log-error
               (format "session=%s on-event kind=%s" session kind) err)))))))))
 
+(defun angelia-client-register-session (conn session on-event on-end)
+  "Register ON-EVENT / ON-END for SESSION on CONN; replay queued events.
+This is THE registration point for session callbacks -- every opener
+\(`angelia-client-open-session', the proc/exec wrappers, ...) must go
+through it, because it also drains the pending-event queue: events that
+were dispatched before the opener regained control (response + first
+notifications processed in one jsonrpc filter pass) are replayed here in
+arrival order, so the stream is lossless.  Returns SESSION."
+  (puthash session
+           (list :on-event on-event :on-end on-end)
+           (angelia-client--conn-sessions conn))
+  (let* ((pending (angelia-client--conn-pending-events conn))
+         (cell (gethash session pending)))
+    (when cell
+      (remhash session pending)
+      (let ((events (nreverse (cdr cell))))
+        (angelia-client--log "session=%s replaying %d queued event(s)"
+                             session (length events))
+        (dolist (params events)
+          (angelia-client--handle-session-event
+           (angelia-client--conn-host conn) params)))))
+  session)
+
+(defun angelia-client-deregister-session (conn session)
+  "Drop SESSION's callbacks from CONN and tombstone it.
+The tombstone makes late events for the deliberately-closed session drop
+instead of queueing for replay.  Tombstones are pruned on the same TTL as
+the pending queues."
+  (remhash session (angelia-client--conn-sessions conn))
+  (remhash session (angelia-client--conn-pending-events conn))
+  (let ((closed (angelia-client--conn-closed-sessions conn)))
+    (angelia-client--prune-session-table closed)
+    (puthash session (current-time) closed)))
+
 (cl-defun angelia-client-open-session (host method params on-event
                                             &key on-end timeout)
   "Call METHOD on HOST with PARAMS and treat its result.session as a session id.
@@ -370,9 +464,7 @@ if the server's response lacks a session id."
     (unless (stringp session)
       (signal 'angelia-client-session-error
               (list :host host :method method :result result)))
-    (puthash session
-             (list :on-event on-event :on-end on-end)
-             (angelia-client--conn-sessions conn))
+    (angelia-client-register-session conn session on-event on-end)
     (angelia-client--log "session opened: host=%s session=%s method=%s"
                          host session method)
     session))
@@ -388,7 +480,7 @@ if the server's response lacks a session id."
 (defun angelia-client-close-session (host session)
   "Request the server end SESSION, then drop the local callback unconditionally."
   (when-let ((conn (gethash host angelia-client--connections)))
-    (remhash session (angelia-client--conn-sessions conn)))
+    (angelia-client-deregister-session conn session))
   (let ((p (make-hash-table :test #'equal)))
     (puthash "session" session p)
     (condition-case err
@@ -414,12 +506,36 @@ if the server's response lacks a session id."
                            (angelia-client--truncate (format "%S" resp) 200))
       resp)))
 
+(defconst angelia-client--idempotent-methods
+  '(server/ping server/version server/info server/lsp-programs
+    file/read file/exists file/directory-p file/attributes
+    file/list-dir file/list-dir-attrs file/completions file/fs-info
+    file/symlink-target file/writable-p file/executable-p file/locked-p
+    file/search file/watch proc/list-persisted)
+  "Methods safe to re-issue after a MID-FLIGHT connection drop.
+When the link dies while a request is pending, the request can have
+EXECUTED on the server even though its response never arrived, so only
+side-effect-free reads -- or session openers, whose pre-drop session died
+with the old server anyway -- may be silently replayed.  Mutations
+\(`file/delete', `file/rename', `file/write-finish', ...) would run twice;
+their error is re-signalled and the caller decides.
+
+This gate does NOT apply when the connection was already known-dead before
+the call (`angelia-client-not-connected'): such a request was never sent,
+so replaying any method after the reconnect is safe.")
+
 (defun angelia-client-call (host method &optional params timeout)
   "Synchronously call METHOD on HOST with PARAMS.  Returns the result.
 TIMEOUT is seconds (default 30).  If the connection has dropped and
-`angelia-client-auto-reconnect' is on, reconnect once and retry transparently
--- but only when the connection is actually dead, so a genuine method error
-\(file not found, etc.) is re-signalled untouched."
+`angelia-client-auto-reconnect' is on, reconnect and retry transparently --
+with one safety gate: a request that was already IN FLIGHT when the link
+died (`jsonrpc-error' & friends) may have executed on the server, so it is
+replayed only when METHOD is in `angelia-client--idempotent-methods';
+replaying a mutation could perform it twice.  A request that was never sent
+\(the connection was already known-dead: `angelia-client-not-connected') is
+safe to issue after the reconnect whatever the method.  Genuine method
+errors (file not found, etc.) on a live connection are re-signalled
+untouched."
   (condition-case err
       (angelia-client--call-once host method params timeout)
     ((angelia-client-not-connected jsonrpc-error error)
@@ -431,7 +547,14 @@ TIMEOUT is seconds (default 30).  If the connection has dropped and
             method host (error-message-string err))
            (ignore-errors (angelia-client-disconnect host))
            (angelia-client-connect host)
-           (angelia-client--call-once host method params timeout))
+           (if (or (eq (car err) 'angelia-client-not-connected)
+                   (memq (if (stringp method) (intern method) method)
+                         angelia-client--idempotent-methods))
+               (angelia-client--call-once host method params timeout)
+             (angelia-client--log
+              "call %s on %s: in-flight at drop and not idempotent, not replayed"
+              method host)
+             (signal (car err) (cdr err))))
        (signal (car err) (cdr err))))))
 
 (defun angelia-client-async (host method params success-fn &optional error-fn)

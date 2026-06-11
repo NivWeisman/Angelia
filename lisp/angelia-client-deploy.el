@@ -239,8 +239,13 @@ BASH-COMMAND.  Per family:
 
 Every login-file `source' redirects its own stdout/stderr to /dev/null so a noisy
 profile can't corrupt the JSON-RPC stream on stdout.  BASH-COMMAND must contain no
-single quotes (csh single-quoting is literal and cannot embed them); all current
-callers satisfy this."
+single quotes (csh single-quoting is literal and cannot embed them); that
+invariant is asserted here rather than trusted, because a violating command
+\(e.g. a user-supplied LSP launch string) would otherwise fail in
+shell-family-dependent, hard-to-diagnose ways."
+  (when (string-match-p "'" bash-command)
+    (error "angelia: remote command must not contain single quotes: %s"
+           bash-command))
   (pcase (angelia-client--detect-shell-family host)
     ('csh
      (concat

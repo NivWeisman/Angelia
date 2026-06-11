@@ -47,7 +47,10 @@ link is noticed instead of hanging on a half-open socket. When a connection
 drops unexpectedly, Angelia reconnects transparently — the next request
 re-establishes the link, and a background retry with exponential backoff runs in
 parallel — then re-registers any live `file-notify` watches against the fresh
-connection. An explicit `M-x angelia-client-disconnect` is never auto-reconnected.
+connection. One safety gate: a request that was already *in flight* when the
+link died may have executed on the server, so after the reconnect it is
+re-issued automatically only if it is side-effect-free; a mutation (delete,
+rename, write-finish, …) surfaces as an error instead of being risked twice. An explicit `M-x angelia-client-disconnect` is never auto-reconnected.
 Tunables: `angelia-client-auto-reconnect`, `angelia-client-keepalive-interval`,
 `angelia-client-reconnect-max-attempts`.
 

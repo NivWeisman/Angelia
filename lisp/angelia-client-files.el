@@ -390,7 +390,10 @@ callback then insert the joined bytes (decoded as UTF-8) at point."
         (delete-region (point-min) (point-max)))
       ;; Buffer is multibyte by default; binary content still survives the
       ;; base64 transport but the in-buffer view may be munged.
-      (insert (decode-coding-string selected 'utf-8 t))
+      (let ((decoded (decode-coding-string selected 'utf-8 t)))
+        (insert decoded)
+        ;; The contract returns CHARACTERS inserted, not bytes.
+        (setq selected decoded))
       (when visit
         (setq buffer-file-name filename)
         (set-buffer-modified-p nil)
@@ -422,6 +425,7 @@ its in-progress tmp file."
          (filename (nth 2 args))
          (append (nth 3 args))
          (visit (nth 4 args))
+         (mustbenew (nth 6 args))
          (bytes (cond
                  ((stringp start) start)
                  ;; `write-region' allows START=END=nil to mean "entire
@@ -434,6 +438,15 @@ its in-progress tmp file."
          (chunk-size angelia-client-files--write-chunk-size))
     (when append
       (error "angelia: write-region :append is not implemented"))
+    ;; MUSTBENEW: `excl' must signal; any other non-nil asks the user, like
+    ;; the local primitive.  Probe-then-write is not atomic (the remote
+    ;; rename can still race another writer), but it honours the contract
+    ;; instead of silently clobbering.
+    (when (and mustbenew
+               (angelia-client-files--rpc-bool host 'file/exists remote))
+      (if (or (eq mustbenew 'excl)
+              (not (y-or-n-p (format "File %s exists; overwrite? " filename))))
+          (signal 'file-already-exists (list "File already exists" filename))))
     ;; Open via `angelia-client-open-session' so the local session row is
     ;; registered (with no-op callbacks) before any events arrive.  The
     ;; server emits a `kind: "end"' notification from `--end-session' inside
@@ -628,13 +641,30 @@ ARGS is (DIRECTORY &optional FULL MATCH NOSORT ID-FORMAT COUNT)."
            (names (plist-get resp :names)))
       (append names nil))))
 
+(defun angelia-client-files--mode-string-to-number (modes)
+  "Convert an ls-style MODES string (\"drwxr-xr-x\") to an integer, or nil.
+`file-modes-symbolic-to-number' canNOT do this -- it parses \"u+x\"-style
+specs and signals a parse error on ls output -- so walk the nine
+permission characters by hand (setuid/setgid/sticky included)."
+  (when (and (stringp modes) (= (length modes) 10))
+    (let ((bits 0))
+      (cl-loop for i from 1 to 9
+               for ch = (aref modes i)
+               for bit = (ash 1 (- 9 i))
+               do (pcase ch
+                    ((or ?r ?w ?x) (setq bits (logior bits bit)))
+                    ;; Lower-case s/t carry the execute bit too.
+                    ((or ?s ?t) (setq bits (logior bits bit)))))
+      (when (memq (aref modes 3) '(?s ?S)) (setq bits (logior bits #o4000)))
+      (when (memq (aref modes 6) '(?s ?S)) (setq bits (logior bits #o2000)))
+      (when (memq (aref modes 9) '(?t ?T)) (setq bits (logior bits #o1000)))
+      bits)))
+
 (defun angelia-client-files--file-modes (host remote)
   "Implement `file-modes' for REMOTE on HOST -- returns an integer or nil."
   (let ((attrs (angelia-client-files--file-attributes host remote)))
     (when attrs
-      (let ((modes (nth 8 attrs)))
-        (and (stringp modes)
-             (file-modes-symbolic-to-number modes))))))
+      (angelia-client-files--mode-string-to-number (nth 8 attrs)))))
 
 (defun angelia-client-files--insert-directory (host remote args)
   "Implement `insert-directory' by shelling out to ls on the remote.
@@ -655,13 +685,17 @@ ARGS is the original (FILE SWITCHES &optional WILDCARD FULL-DIRECTORY-P)."
                              (angelia-client--truncate stderr 200))))))
 
 (defun angelia-client-files--resolve-bufferspec (buffer)
-  "Translate process-file's BUFFER spec into (STDOUT-BUF . STDERR-FILE)."
+  "Translate process-file's BUFFER spec into (STDOUT-BUF . STDERR-DEST).
+STDERR-DEST is nil (discard / default mixing), the symbol `mix' (mix into
+STDOUT-BUF, the meaning of t in a cons spec), a file name string, or a
+buffer (used by the `shell-command' handler, whose ERROR-BUFFER arg is a
+buffer or buffer name rather than a file)."
   (cond
    ((null buffer)              (cons nil nil))
-   ((eq buffer t)              (cons (current-buffer) nil))
+   ((eq buffer t)              (cons (current-buffer) 'mix))
    ((eq buffer 0)              (cons nil nil))
-   ((bufferp buffer)           (cons buffer nil))
-   ((stringp buffer)           (cons (get-buffer-create buffer) nil))
+   ((bufferp buffer)           (cons buffer 'mix))
+   ((stringp buffer)           (cons (get-buffer-create buffer) 'mix))
    ((consp buffer)
     (let* ((sb (car buffer))
            (eb (cadr buffer))
@@ -670,10 +704,11 @@ ARGS is the original (FILE SWITCHES &optional WILDCARD FULL-DIRECTORY-P)."
                      ((bufferp sb) sb)
                      ((stringp sb) (get-buffer-create sb))))
            (se (cond ((null eb) nil)
-                     ((eq eb t) nil)            ; mix into stdout
+                     ((eq eb t) 'mix)
+                     ((bufferp eb) eb)
                      ((stringp eb) eb))))
       (cons so se)))
-   (t (cons (current-buffer) nil))))
+   (t (cons (current-buffer) 'mix))))
 
 (defun angelia-client-files--process-file (host remote-dir args)
   "Implement `process-file' for an angelia `default-directory'.
@@ -702,7 +737,7 @@ ARGS is (PROGRAM &optional INFILE BUFFER DISPLAY &rest CMDARGS)."
                  (t nil)))
          (dest (angelia-client-files--resolve-bufferspec buffer))
          (out-buf (car dest))
-         (err-file (cdr dest))
+         (err-dest (cdr dest))
          (result (angelia-client--exec host (cons program cmdargs)
                                        :cwd remote-dir
                                        :stdin stdin))
@@ -713,17 +748,20 @@ ARGS is (PROGRAM &optional INFILE BUFFER DISPLAY &rest CMDARGS)."
     (when (and out-buf (> (length stdout) 0))
       (with-current-buffer out-buf
         (insert (decode-coding-string stdout 'utf-8 t))))
-    (cond
-     (err-file
-      (when (> (length stderr) 0)
+    (when (> (length stderr) 0)
+      (cond
+       ((stringp err-dest)
         (let ((coding-system-for-write 'binary))
           (with-temp-buffer
             (set-buffer-multibyte nil)
             (insert stderr)
-            (write-region (point-min) (point-max) err-file nil 'silent)))))
-     ((and out-buf (not (consp buffer)) (> (length stderr) 0))
-      (with-current-buffer out-buf
-        (insert (decode-coding-string stderr 'utf-8 t)))))
+            (write-region (point-min) (point-max) err-dest nil 'silent))))
+       ((bufferp err-dest)
+        (with-current-buffer err-dest
+          (insert (decode-coding-string stderr 'utf-8 t))))
+       ((and (eq err-dest 'mix) out-buf)
+        (with-current-buffer out-buf
+          (insert (decode-coding-string stderr 'utf-8 t))))))
     (cond ((and signal (not (eq signal :null)))
            (format "signal: %s" signal))
           ((integerp exit) exit)
@@ -960,10 +998,16 @@ Unrecognized operations fall through to the default handler chain."
       ;; on the remote.  Magit and many other packages rely on this.
       (let* ((cmd (nth 0 args))
              (out (nth 1 args))
-             (err (nth 2 args)))
+             (err (nth 2 args))
+             ;; ERROR-BUFFER is a buffer or buffer name; hand the buffer
+             ;; object to the cons spec so `--resolve-bufferspec' routes
+             ;; stderr there instead of dropping it.
+             (buffer-spec (if err
+                              (list (or out t) (get-buffer-create err))
+                            (or out t))))
         (angelia-client-files--process-file
          host remote-dir
-         (list shell-file-name nil (or out t) nil
+         (list shell-file-name nil buffer-spec nil
                shell-command-switch cmd))))
      ((eq operation 'file-remote-p)
       ;; Return the prefix that uniquely identifies the connection: magit
@@ -1019,6 +1063,12 @@ Unrecognized operations fall through to the default handler chain."
           (angelia-client-files--make-path
            (car name-parsed)
            (angelia-client-files--normalize-remote (cdr name-parsed))))
+         ;; `~...' relative to an angelia DIR is home-relative on the
+         ;; REMOTE host: wrap it verbatim (the remote expands the tilde).
+         ;; Joining it would run it through the local `expand-file-name',
+         ;; which substitutes the LOCAL home directory.
+         ((and dir-parsed (string-prefix-p "~" name))
+          (angelia-client-files--make-path (car dir-parsed) name))
          (dir-parsed
           (angelia-client-files--make-path
            (car dir-parsed)

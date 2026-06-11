@@ -31,6 +31,39 @@
   (and (angelia-client-proc-p handle)
        (not (angelia-client-proc-exited handle))))
 
+(defun angelia-client-proc--register (conn handle)
+  "Register session callbacks for HANDLE on CONN (replaying queued events).
+Shared by `angelia-client-proc-start' and `angelia-client-proc-reattach':
+`output' chunks are base64-decoded into ON-OUTPUT, the terminal `exit'
+event becomes the ON-EXIT plist, and `end' (which also covers a transport
+drop closed on our side) marks the handle dead."
+  (let ((session (angelia-client-proc-session handle)))
+    (angelia-client-register-session
+     conn session
+     (lambda (kind p)
+       (pcase kind
+         ("output"
+          (when (angelia-client-proc-on-output handle)
+            (condition-case err
+                (funcall (angelia-client-proc-on-output handle)
+                         (base64-decode-string (plist-get p :data)))
+              (error
+               (angelia-client--log-error
+                (format "proc on-output session=%s" session) err)))))
+         ("exit"
+          (setf (angelia-client-proc-exited handle) t)
+          (when (angelia-client-proc-on-exit handle)
+            (condition-case err
+                (funcall (angelia-client-proc-on-exit handle)
+                         (list :code (plist-get p :code)
+                               :signal (plist-get p :signal)
+                               :event (plist-get p :event)))
+              (error
+               (angelia-client--log-error
+                (format "proc on-exit session=%s" session) err)))))))
+     (lambda (_p)
+       (setf (angelia-client-proc-exited handle) t)))))
+
 ;; ---------------------------------------------------------------------------
 ;; Lifecycle.
 
@@ -91,38 +124,7 @@ When PERSIST is nil, BACKEND is ignored."
                      :host host :session session :pid pid
                      :on-output on-output :on-exit on-exit
                      :buffer buffer)))
-        (puthash session
-                 (list :on-event
-                       (lambda (kind p)
-                         (pcase kind
-                           ("output"
-                            (when (angelia-client-proc-on-output handle)
-                              (condition-case err
-                                  (funcall (angelia-client-proc-on-output handle)
-                                           (base64-decode-string
-                                            (plist-get p :data)))
-                                (error
-                                 (angelia-client--log-error
-                                  (format "proc on-output session=%s" session)
-                                  err)))))
-                           ("exit"
-                            (setf (angelia-client-proc-exited handle) t)
-                            (when (angelia-client-proc-on-exit handle)
-                              (condition-case err
-                                  (funcall (angelia-client-proc-on-exit handle)
-                                           (list :code (plist-get p :code)
-                                                 :signal (plist-get p :signal)
-                                                 :event (plist-get p :event)))
-                                (error
-                                 (angelia-client--log-error
-                                  (format "proc on-exit session=%s" session)
-                                  err)))))))
-                       :on-end
-                       (lambda (_p)
-                         ;; Defensive: if `exit' never ran (transport drop
-                         ;; with a close-on-our-side), still mark dead.
-                         (setf (angelia-client-proc-exited handle) t)))
-                 (angelia-client--conn-sessions conn))
+        (angelia-client-proc--register conn handle)
         (angelia-client--log
          "proc started: host=%s session=%s pid=%s argv=%S"
          host session pid argv)
@@ -299,36 +301,7 @@ Callbacks behave exactly as `angelia-client-proc-start'.  Returns a handle."
                      :host host :session session :pid pid
                      :on-output on-output :on-exit on-exit
                      :buffer buffer)))
-        (puthash session
-                 (list :on-event
-                       (lambda (kind p)
-                         (pcase kind
-                           ("output"
-                            (when (angelia-client-proc-on-output handle)
-                              (condition-case err
-                                  (funcall (angelia-client-proc-on-output handle)
-                                           (base64-decode-string
-                                            (plist-get p :data)))
-                                (error
-                                 (angelia-client--log-error
-                                  (format "proc on-output session=%s" session)
-                                  err)))))
-                           ("exit"
-                            (setf (angelia-client-proc-exited handle) t)
-                            (when (angelia-client-proc-on-exit handle)
-                              (condition-case err
-                                  (funcall (angelia-client-proc-on-exit handle)
-                                           (list :code (plist-get p :code)
-                                                 :signal (plist-get p :signal)
-                                                 :event (plist-get p :event)))
-                                (error
-                                 (angelia-client--log-error
-                                  (format "proc on-exit session=%s" session)
-                                  err)))))))
-                       :on-end
-                       (lambda (_p)
-                         (setf (angelia-client-proc-exited handle) t)))
-                 (angelia-client--conn-sessions conn))
+        (angelia-client-proc--register conn handle)
         (angelia-client--log
          "proc reattached: host=%s session=%s pid=%s name=%s backend=%s"
          host session pid name backend)
@@ -343,8 +316,8 @@ underlying CMD alive only when there is one)."
     (puthash "session" (angelia-client-proc-session handle) p)
     (when-let ((conn (gethash (angelia-client-proc-host handle)
                               angelia-client--connections)))
-      (remhash (angelia-client-proc-session handle)
-               (angelia-client--conn-sessions conn)))
+      (angelia-client-deregister-session
+       conn (angelia-client-proc-session handle)))
     (condition-case err
         (angelia-client-call (angelia-client-proc-host handle) 'proc/detach p 5)
       (error
@@ -401,25 +374,24 @@ unibyte strings; for unbounded output use the async path instead."
       (unless (stringp session)
         (signal 'angelia-client-session-error
                 (list :host host :method 'proc/exec :result result)))
-      (puthash session
-               (list :on-event
-                     (lambda (kind p)
-                       (pcase kind
-                         ("stdout"
-                          (push (base64-decode-string (plist-get p :data))
-                                stdout-acc))
-                         ("stderr"
-                          (push (base64-decode-string (plist-get p :data))
-                                stderr-acc))
-                         ("exit"
-                          (setq exit-info
-                                (list :code (plist-get p :code)
-                                      :signal (plist-get p :signal)
-                                      :event (plist-get p :event))))))
-                     :on-end (lambda (_p)
-                               (unless exit-info
-                                 (setq exit-info '(:code nil :signal nil)))))
-               (angelia-client--conn-sessions conn))
+      (angelia-client-register-session
+       conn session
+       (lambda (kind p)
+         (pcase kind
+           ("stdout"
+            (push (base64-decode-string (plist-get p :data))
+                  stdout-acc))
+           ("stderr"
+            (push (base64-decode-string (plist-get p :data))
+                  stderr-acc))
+           ("exit"
+            (setq exit-info
+                  (list :code (plist-get p :code)
+                        :signal (plist-get p :signal)
+                        :event (plist-get p :event))))))
+       (lambda (_p)
+         (unless exit-info
+           (setq exit-info '(:code nil :signal nil)))))
       (with-timeout ((or timeout angelia-client-exec-timeout)
                      (angelia-client-close-session host session)
                      (error "proc/exec timed out: %S" argv))
@@ -472,11 +444,11 @@ string and delete the pipe (so `process-status' flips to closed and
       (process-put proc 'angelia-host host)
       (process-put proc 'angelia-session session)
       (process-put proc 'angelia-pid pid)
-      (puthash session
-               (list :on-event
-                     (lambda (kind p)
-                       (pcase kind
-                         ((or "stdout" "stderr")
+      (angelia-client-register-session
+       conn session
+       (lambda (kind p)
+         (pcase kind
+           ((or "stdout" "stderr")
                           (let ((bytes (base64-decode-string
                                         (plist-get p :data)))
                                 (f (process-filter proc)))
@@ -518,8 +490,7 @@ string and delete the pipe (so `process-status' flips to closed and
                                   (error
                                    (angelia-client--log-error
                                     "exec-async sentinel" err)))))))))
-                     :on-end (lambda (_p) nil))
-               (angelia-client--conn-sessions conn))
+       (lambda (_p) nil))
       proc)))
 
 (defun angelia-client--exec-process-exit-status (proc)
