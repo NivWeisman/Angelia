@@ -267,8 +267,18 @@ on transport / handshake failure (cleaning up the dead process first)."
                                 :got remote-sha))))
               (angelia-client--log "connect: ok host=%s" host)
               ;; Let dependents (e.g. file-notify watch re-registration) react to
-              ;; a fresh connection.  Errors in a hook fn must not fail connect.
-              (run-hook-with-args 'angelia-client-after-connect-functions host)
+              ;; a fresh connection.  Errors in a hook fn must not fail connect:
+              ;; the connection is already up and healthy, and this variable is
+              ;; a public extension point -- so contain them per-function (one
+              ;; broken hook neither skips the others nor bubbles into the
+              ;; cleanup branch below, which would tear the live process down).
+              (run-hook-wrapped
+               'angelia-client-after-connect-functions
+               (lambda (fn)
+                 (condition-case hook-err
+                     (funcall fn host)
+                   (error (angelia-client--log-error "after-connect hook" hook-err)))
+                 nil))
               conn)
           (error
            (angelia-client--log-error "connect" err)

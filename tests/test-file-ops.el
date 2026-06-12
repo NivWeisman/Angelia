@@ -117,6 +117,18 @@ file/list-dir RPC that backs any future dired support."
       (should (member "." files))
       (should (member ".." files)))))
 
+(ert-deftest test-dired-remote-count ()
+  "`directory-files' honours its COUNT argument on remote paths."
+  (angelia-tests--file-ops-setup)
+  (with-angelia-connection angelia-tests--target-host _conn
+    (let ((all (directory-files (angelia-tests--remote "/tmp")))
+          (two (directory-files (angelia-tests--remote "/tmp") nil nil nil 2)))
+      ;; "/tmp" always holds at least "." and ".." plus the setup files.
+      (should (> (length all) 2))
+      (should (= 2 (length two)))
+      ;; Both calls sort, so COUNT must take the first names of the same order.
+      (should (equal two (cl-subseq all 0 2))))))
+
 (ert-deftest test-mkdir-remote ()
   "`make-directory' on a remote URL creates the directory on disk."
   (angelia-tests--file-ops-setup)

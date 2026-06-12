@@ -1312,15 +1312,19 @@ Returns `{accepted: N}'."
       result)))
 
 (defun angelia-server--proc-reattach (conn params)
-  "Open a fresh PTY session re-entering the persisted PARAMS->name on BACKEND."
+  "Open a fresh PTY session re-entering the persisted PARAMS->name on BACKEND.
+PARAMS->backend is optional and defaults to the first available backend
+\(dtach > tmux > screen), mirroring `proc/start's persist defaulting."
   (let* ((name (and (hash-table-p params) (gethash "name" params)))
-         (backend-name (and (hash-table-p params) (gethash "backend" params)))
+         (backend-name (or (and (hash-table-p params) (gethash "backend" params))
+                           (angelia-server--default-backend-name)))
          (backend (and backend-name
                        (angelia-server--backend-by-name backend-name))))
     (unless (stringp name)
       (error "proc/reattach: missing string `name'"))
     (unless backend
-      (error "proc/reattach: unknown backend: %S" backend-name))
+      (error "proc/reattach: unknown backend: %S (installed: %S)"
+             backend-name (mapcar #'car angelia-server--proc-backends)))
     (let* ((argv (funcall (angelia-server--proc-backend-reattach backend) name))
            ;; Synthesize a `params' for proc/start that runs the reattach argv
            ;; directly (already wrapped; do NOT re-wrap via persist).
@@ -1524,6 +1528,28 @@ process command line, while `proc/list-persisted' / `proc/reattach' /
   "Return the dtach socket path for persisted session NAME."
   (expand-file-name (concat name ".sock") angelia-server--dtach-sock-dir))
 
+(defun angelia-server--dtach-socket-alive-p (sock)
+  "Return non-nil when a dtach master is actually listening on SOCK.
+A socket file can outlive its daemon (crash, host reboot), so listing by
+file existence alone reports stale sessions as alive.  Probe with a real
+local-domain connect: refused/failed means stale.  The dtach master treats
+a client that connects and immediately disconnects as a no-op, so the
+probe is side-effect-free."
+  (when (file-exists-p sock)
+    (let ((probe nil))
+      (unwind-protect
+          (condition-case nil
+              (progn
+                (setq probe (make-network-process
+                             :name "angelia-dtach-probe"
+                             :family 'local
+                             :service sock
+                             :noquery t))
+                t)
+            (error nil))
+        (when (and probe (process-live-p probe))
+          (delete-process probe))))))
+
 (defun angelia-server--ere-quote (s)
   "Quote S for use as a literal inside a POSIX extended regexp.
 `regexp-quote' escapes for EMACS regexp syntax, which differs from the ERE
@@ -1551,7 +1577,12 @@ they are literals unless backslashed -- in ERE they are operators)."
        (let (result)
          (dolist (f (directory-files angelia-server--dtach-sock-dir
                                      nil "\\.sock\\'"))
-           (push (list (file-name-sans-extension f) t) result))
+           (push (list (file-name-sans-extension f)
+                       (and (angelia-server--dtach-socket-alive-p
+                             (expand-file-name
+                              f angelia-server--dtach-sock-dir))
+                            t))
+                 result))
          result)))
    :kill-fn
    (lambda (name)

@@ -285,11 +285,15 @@ non-nil, the server restricts the listing to that backend."
 (cl-defun angelia-client-proc-reattach (host name backend
                                              &key on-output on-exit buffer)
   "Open a fresh PTY session re-entering persisted NAME under BACKEND on HOST.
-Callbacks behave exactly as `angelia-client-proc-start'.  Returns a handle."
+BACKEND may be nil, in which case the server picks its first available
+backend (dtach > tmux > screen), mirroring `angelia-client-proc-start's
+persist defaulting.  Callbacks behave exactly as `angelia-client-proc-start'.
+Returns a handle."
   (let* ((conn (angelia-client-connection host))
          (params (make-hash-table :test #'equal)))
     (puthash "name" name params)
-    (puthash "backend" (angelia-client-proc--backend-string backend) params)
+    (when backend
+      (puthash "backend" (angelia-client-proc--backend-string backend) params))
     (let* ((result (jsonrpc-request (angelia-client--conn-jsonrpc conn)
                                     'proc/reattach params))
            (session (plist-get result :session))

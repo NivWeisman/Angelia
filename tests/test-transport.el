@@ -251,6 +251,28 @@ reconnects and succeeds on a genuinely new process."
       (when (gethash angelia-tests--target-host angelia-client--connections)
         (angelia-client-disconnect angelia-tests--target-host)))))
 
+(ert-deftest test-connect-survives-failing-after-connect-hook ()
+  "An error in one after-connect hook neither fails connect nor skips the rest.
+The hook variable is a public extension point; before the fix a signalling
+hook bubbled into connect's cleanup branch, which tore down the live
+connection it had just established."
+  (angelia-tests--transport-setup)
+  (let* ((later-ran nil)
+         (angelia-client-after-connect-functions
+          (append angelia-client-after-connect-functions
+                  (list (lambda (_h) (error "deliberate hook failure"))
+                        (lambda (_h) (setq later-ran t))))))
+    (with-angelia-connection angelia-tests--target-host conn
+      (should conn)
+      (should (angelia-client--existing-live-connection
+               angelia-tests--target-host))
+      ;; The hook after the failing one still ran.
+      (should later-ran)
+      ;; And the connection is genuinely usable.
+      (should (eq t (plist-get (angelia-client-call
+                                angelia-tests--target-host 'server/ping nil)
+                               :pong))))))
+
 (ert-deftest test-explicit-disconnect-no-auto-reconnect ()
   "An explicit `angelia-client-disconnect' is never auto-reconnected."
   (angelia-tests--transport-setup)

@@ -523,6 +523,13 @@ friends, which simply return nil for unreadable paths rather than erroring)."
     (jsonrpc-error nil)
     (error nil)))
 
+(defun angelia-client-files--take (list count)
+  "Return the first COUNT elements of LIST, or LIST when COUNT is not a count.
+Backs the COUNT argument of `directory-files' (and -and-attributes)."
+  (if (and (integerp count) (>= count 0) (< count (length list)))
+      (cl-subseq list 0 count)
+    list))
+
 (defun angelia-client-files--directory-files (host remote args)
   "Implement `directory-files' for REMOTE on HOST.
 ARGS is the full argument list (DIRECTORY FULL MATCH NOSORT &optional COUNT)."
@@ -530,6 +537,7 @@ ARGS is the full argument list (DIRECTORY FULL MATCH NOSORT &optional COUNT)."
          (full      (nth 1 args))
          (match     (nth 2 args))
          (nosort    (nth 3 args))
+         (count     (nth 4 args))
          (resp (angelia-client-call
                 host 'file/list-dir
                 (angelia-client-files--params "path" remote)))
@@ -540,7 +548,8 @@ ARGS is the full argument list (DIRECTORY FULL MATCH NOSORT &optional COUNT)."
                        (cl-remove-if-not (lambda (n) (string-match-p match n))
                                          names)
                      names))
-         (sorted (if nosort filtered (sort filtered #'string<)))
+         (sorted (angelia-client-files--take
+                  (if nosort filtered (sort filtered #'string<)) count))
          (dir (if (string-suffix-p "/" directory)
                   directory (concat directory "/"))))
     (if full
@@ -600,6 +609,7 @@ ARGS is (DIRECTORY &optional FULL MATCH NOSORT ID-FORMAT COUNT)."
          (full      (nth 1 args))
          (match     (nth 2 args))
          (nosort    (nth 3 args))
+         (count     (nth 5 args))
          (resp (angelia-client-call
                 host 'file/list-dir-attrs
                 (angelia-client-files--params "path" remote)))
@@ -609,11 +619,13 @@ ARGS is (DIRECTORY &optional FULL MATCH NOSORT ID-FORMAT COUNT)."
                         (lambda (e) (string-match-p match (plist-get e :name)))
                         entries)
                      entries))
-         (sorted (if nosort filtered
-                   (sort filtered
-                         (lambda (a b)
-                           (string< (plist-get a :name)
-                                    (plist-get b :name))))))
+         (sorted (angelia-client-files--take
+                  (if nosort filtered
+                    (sort filtered
+                          (lambda (a b)
+                            (string< (plist-get a :name)
+                                     (plist-get b :name)))))
+                  count))
          (dir (if (string-suffix-p "/" directory)
                   directory (concat directory "/"))))
     (mapcar

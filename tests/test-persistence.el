@@ -259,4 +259,56 @@ isn't installed."
           (angelia-client-proc-kill-persisted
            angelia-tests--persist-host pname 'dtach))))))
 
+(ert-deftest test-persist-reattach-default-backend ()
+  "`proc/reattach' without an explicit backend uses the server's default
+\(dtach when installed), mirroring `proc/start's persist defaulting."
+  (skip-unless (executable-find "dtach"))
+  (angelia-tests-ensure-no-connections)
+  (with-angelia-connection angelia-tests--persist-host _conn
+    (let* ((pname (angelia-tests--unique-persist-name "reattDef"))
+           (out "")
+           (handle nil))
+      (unwind-protect
+          (progn
+            (setq handle (angelia-client-proc-start
+                          angelia-tests--persist-host
+                          (list "bash" "--norc" "--noprofile" "-i")
+                          :persist pname :backend 'dtach))
+            (sleep-for 0.3)
+            (angelia-client-proc-detach handle)
+            (let ((re-handle (angelia-client-proc-reattach
+                              angelia-tests--persist-host pname nil ; <- default
+                              :on-output (lambda (b)
+                                           (setq out (concat out b))))))
+              (sleep-for 0.3)
+              (angelia-client-proc-send re-handle "echo MARK_DEFAULT\n")
+              (angelia-tests--wait-for-match (lambda () out) "MARK_DEFAULT" 5)
+              (angelia-client-proc-detach re-handle)))
+        (ignore-errors
+          (angelia-client-proc-kill-persisted
+           angelia-tests--persist-host pname 'dtach))))))
+
+(ert-deftest test-persist-stale-dtach-socket-listed-dead ()
+  "A dtach socket file whose master is gone is listed with :alive nil.
+Simulated by dropping a plain file with a .sock name into the (localhost)
+socket directory -- nothing listens on it, so the liveness probe must fail."
+  (skip-unless (executable-find "dtach"))
+  (angelia-tests-ensure-no-connections)
+  (with-angelia-connection angelia-tests--persist-host _conn
+    (let* ((stale-name (angelia-tests--unique-persist-name "stale"))
+           ;; Host is localhost, so the server's socket dir is local too.
+           (sock-dir (expand-file-name "~/.cache/angelia/dtach"))
+           (stale-sock (expand-file-name (concat stale-name ".sock") sock-dir)))
+      (unwind-protect
+          (progn
+            (make-directory sock-dir t)
+            (angelia-tests-write-file stale-sock "not a real socket")
+            (let ((listing (angelia-client-proc-list-persisted
+                            angelia-tests--persist-host 'dtach)))
+              (should (cl-some (lambda (s)
+                                 (and (equal (plist-get s :name) stale-name)
+                                      (not (plist-get s :alive))))
+                               listing))))
+        (ignore-errors (delete-file stale-sock))))))
+
 ;;; test-persistence.el ends here

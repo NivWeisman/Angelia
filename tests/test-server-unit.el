@@ -638,4 +638,29 @@ empty AND the backtrace text was injected into whatever buffer was current."
   (should (equal "\\[x\\]\\{2\\}\\(y\\)\\|z\\*\\?\\^\\$\\\\"
                  (angelia-server--ere-quote "[x]{2}(y)|z*?^$\\"))))
 
+;; ---------------------------------------------------------------------------
+;; dtach socket liveness probe (backs the persisted-session listing).
+
+(ert-deftest test-server-dtach-socket-alive-probe ()
+  "A listening local socket probes alive; a dead daemon or no file does not.
+No dtach involved: the probe is a plain local-domain connect, so any
+listener (here a throwaway Emacs server process) stands in for the master."
+  (angelia-tests-with-temp-dir dir
+    (let* ((sock (expand-file-name "probe.sock" dir))
+           (server (make-network-process
+                    :name "angelia-test-sock-server"
+                    :server t :family 'local :service sock :noquery t)))
+      (unwind-protect
+          (should (angelia-server--dtach-socket-alive-p sock))
+        (delete-process server))
+      ;; Daemon gone: whether the socket file lingers (ECONNREFUSED) or was
+      ;; unlinked (no file), the probe must report dead.
+      (should-not (angelia-server--dtach-socket-alive-p sock))
+      ;; A regular file at the path is equally dead, not an error.
+      (let ((plain (expand-file-name "not-a-socket.sock" dir)))
+        (angelia-tests-write-file plain "stale")
+        (should-not (angelia-server--dtach-socket-alive-p plain)))
+      (should-not (angelia-server--dtach-socket-alive-p
+                   (expand-file-name "never-existed.sock" dir))))))
+
 ;;; test-server-unit.el ends here
